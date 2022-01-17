@@ -23,8 +23,8 @@
 #define TUN_INTERFACE     "tun_client"
 #define INTERFACE_ADDRESS "10.8.0.2/16"
 #else
-#define BIND_HOST "0.0.0.0"
-#define SERVER_SUBNET "10.8.0.0/16"
+#define BIND_HOST         "0.0.0.0"
+#define SERVER_SUBNET     "10.8.0.0/16"
 #define TUN_INTERFACE     "tun_server"
 #define INTERFACE_ADDRESS "10.8.0.1/16"
 #endif
@@ -35,7 +35,7 @@
 /*
  * Create VPN interface /dev/tun0 and return a fd
  */
-static int tun_alloc (void)
+static int tun_alloc(void)
 {
     printf("Creating tun interface %s\n", TUN_INTERFACE);
 
@@ -63,7 +63,7 @@ static int tun_alloc (void)
 /*
  * Execute commands
  */
-static void run (char *cmd, ...)
+static void run(char *cmd, ...)
 {
     char buf[1024];
     va_list args;
@@ -81,7 +81,7 @@ static void run (char *cmd, ...)
 /*
  * Setup route table via `iptables` & `ip route`
  */
-static void setup_route_table (void)
+static void setup_route_table(void)
 {
     printf("Adding routing tables\n");
 
@@ -105,7 +105,7 @@ static void setup_route_table (void)
 /*
  * Cleanup route table
  */
-static void cleanup_route_table (void)
+static void cleanup_route_table(void)
 {
 #ifdef AS_CLIENT
     run("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", TUN_INTERFACE);
@@ -124,7 +124,7 @@ static void cleanup_route_table (void)
 /*
  * Bind UDP port
  */
-static int udp_bind (struct sockaddr *addr, socklen_t *addrlen)
+static int udp_bind(struct sockaddr *addr, socklen_t *addrlen)
 {
     struct addrinfo hints = {
         .ai_socktype = SOCK_DGRAM,
@@ -189,7 +189,7 @@ static int udp_bind (struct sockaddr *addr, socklen_t *addrlen)
 /*
  * Catch Ctrl-C and `kill`s, make sure route table gets cleaned before this process exit
  */
-static void cleanup (int signo)
+static void cleanup(int signo)
 {
     printf("Exiting....\n");
     if (signo == SIGHUP || signo == SIGINT || signo == SIGTERM) {
@@ -198,11 +198,11 @@ static void cleanup (int signo)
     }
 }
 
-static void cleanup_when_sig_exit (void)
+static void cleanup_when_sig_exit(void)
 {
     struct sigaction sa = {
         .sa_handler = &cleanup,
-        .sa_flags = SA_RESTART,
+        .sa_flags   = SA_RESTART,
     };
     sigfillset(&sa.sa_mask);
 
@@ -222,12 +222,12 @@ static void cleanup_when_sig_exit (void)
  * A comprehensive encryption is not easy and not the point for this demo
  * I'll just leave the stubs here
  */
-static void encrypt (char *plantext, char *ciphertext, size_t len)
+static void encrypt(char *plantext, char *ciphertext, size_t len)
 {
     memcpy(ciphertext, plantext, len);
 }
 
-static void decrypt (char *ciphertext, char *plantext, size_t len)
+static void decrypt(char *ciphertext, char *plantext, size_t len)
 {
     memcpy(plantext, ciphertext, len);
 }
@@ -239,7 +239,7 @@ typedef struct {
     socklen_t clientAddrLen;
 } udpSettings_t;
 
-static bool tunToUdp (fd_set readSet, int tunFd, char *tunBuf, udpSettings_t udpSettings)
+static bool tunToUdp(fd_set readSet, int tunFd, char *tunBuf, udpSettings_t udpSettings)
 {
     if (FD_ISSET(tunFd, &readSet)) {
         const ssize_t tunBytesRead = read(tunFd, tunBuf, MTU);
@@ -253,9 +253,8 @@ static bool tunToUdp (fd_set readSet, int tunFd, char *tunBuf, udpSettings_t udp
         printf("%zu>", tunBytesRead);
         fflush(stdout);
 
-        const ssize_t bytesWritten =
-            sendto(udpSettings.fd, udpSettings.buf, tunBytesRead, 0, (const struct sockaddr *) &udpSettings.clientAddr,
-                   udpSettings.clientAddrLen);
+        const ssize_t bytesWritten = sendto(udpSettings.fd, udpSettings.buf, tunBytesRead, 0,
+                                            (const struct sockaddr *) &udpSettings.clientAddr, udpSettings.clientAddrLen);
         if (bytesWritten < 0) {
             // TODO: ignore some errno
             perror("sendto udpFd error");
@@ -266,7 +265,7 @@ static bool tunToUdp (fd_set readSet, int tunFd, char *tunBuf, udpSettings_t udp
     return true;
 }
 
-static bool udpToTun (fd_set readSet, udpSettings_t udpSettings, int tunFd, char *tunBuf)
+static bool udpToTun(fd_set readSet, udpSettings_t udpSettings, int tunFd, char *tunBuf)
 {
     if (FD_ISSET(udpSettings.fd, &readSet)) {
         const ssize_t udpBytesRead = recvfrom(udpSettings.fd, udpSettings.buf, MTU, 0, (struct sockaddr *) &udpSettings.clientAddr,
@@ -291,7 +290,7 @@ static bool udpToTun (fd_set readSet, udpSettings_t udpSettings, int tunFd, char
     return true;
 }
 
-int main (int argc, char **argv)
+int main(int argc, char **argv)
 {
     UNUSED(argc);
     UNUSED(argv);
@@ -314,7 +313,7 @@ int main (int argc, char **argv)
 
     udpSettings_t udpData = {
         .clientAddrLen = sizeof(udpData.clientAddr),
-        .fd = udp_bind((struct sockaddr *) &udpData.clientAddr, &udpData.clientAddrLen),
+        .fd            = udp_bind((struct sockaddr *) &udpData.clientAddr, &udpData.clientAddrLen),
     };
     if (udpData.fd < 0) {
         printf("Error binding UDP: %d\n", udpData.fd);
