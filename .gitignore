@@ -1,5 +1,7 @@
 a.out
 vpn
+client
+server
 test.c
 Vagrantfile
 .vagrant
