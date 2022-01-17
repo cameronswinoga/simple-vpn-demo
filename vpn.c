@@ -15,21 +15,22 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 
-#define PORT      54345
-#define MTU       1400
-#define BIND_HOST "0.0.0.0"
+#define PORT 54345
+#define MTU  1400
 
 #if defined(AS_CLIENT)
-#define TUN_INTERFACE "tun_client"
+#define SERVER_HOST       "127.0.0.1"
+#define TUN_INTERFACE     "tun_client"
 #define INTERFACE_ADDRESS "10.8.0.2/16"
 #else
-#define TUN_INTERFACE "tun_server"
+#define BIND_HOST "0.0.0.0"
+#define TUN_INTERFACE     "tun_server"
 #define INTERFACE_ADDRESS "10.8.0.1/16"
 #endif
 
-#define UNUSED(x) (void)(x)
+#define UNUSED(x) (void) (x)
 
-static int max(int a, int b)
+static int max (int a, int b)
 {
     return a > b ? a : b;
 }
@@ -37,7 +38,7 @@ static int max(int a, int b)
 /*
  * Create VPN interface /dev/tun0 and return a fd
  */
-static int tun_alloc(void)
+static int tun_alloc (void)
 {
     printf("Creating tun interface %s\n", TUN_INTERFACE);
     struct ifreq ifr;
@@ -65,7 +66,7 @@ static int tun_alloc(void)
 /*
  * Execute commands
  */
-static void run(char *cmd, ...)
+static void run (char *cmd, ...)
 {
     char buf[1024];
     va_list args;
@@ -83,7 +84,7 @@ static void run(char *cmd, ...)
 /*
  * Setup route table via `iptables` & `ip route`
  */
-static void setup_route_table(void)
+static void setup_route_table (void)
 {
     printf("Adding routing tables\n");
 
@@ -96,6 +97,7 @@ static void setup_route_table(void)
     run("ip route add %s via 192.168.1.1", SERVER_HOST);
     run("ip route add 0/1 dev %s", TUN_INTERFACE);
     run("ip route add 128/1 dev %s", TUN_INTERFACE);
+    run("ip route add 192.168.1.30/32 dev %s proto static", TUN_INTERFACE);
 #else
     run("iptables -t nat -A POSTROUTING -s 10.8.0.0/16 ! -d 10.8.0.0/16 -m comment --comment 'vpndemo' -j MASQUERADE");
     run("iptables -A FORWARD -s 10.8.0.0/16 -m state --state RELATED,ESTABLISHED -j ACCEPT");
@@ -106,7 +108,7 @@ static void setup_route_table(void)
 /*
  * Cleanup route table
  */
-static void cleanup_route_table(void)
+static void cleanup_route_table (void)
 {
 #ifdef AS_CLIENT
     run("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", TUN_INTERFACE);
@@ -125,7 +127,7 @@ static void cleanup_route_table(void)
 /*
  * Bind UDP port
  */
-static int udp_bind(struct sockaddr *addr, socklen_t *addrlen)
+static int udp_bind (struct sockaddr *addr, socklen_t *addrlen)
 {
     struct addrinfo hints;
     struct addrinfo *result;
@@ -145,10 +147,12 @@ static int udp_bind(struct sockaddr *addr, socklen_t *addrlen)
         return -1;
     }
 
-    if (result->ai_family == AF_INET)
+    if (result->ai_family == AF_INET) {
         ((struct sockaddr_in *) result->ai_addr)->sin_port = htons(PORT);
-    else if (result->ai_family == AF_INET6)
+    }
+    else if (result->ai_family == AF_INET6) {
         ((struct sockaddr_in6 *) result->ai_addr)->sin6_port = htons(PORT);
+    }
     else {
         fprintf(stderr, "unknown ai_family %d", result->ai_family);
         freeaddrinfo(result);
@@ -176,8 +180,9 @@ static int udp_bind(struct sockaddr *addr, socklen_t *addrlen)
 
     const int flags = fcntl(sock, F_GETFL, 0);
     if (flags != -1) {
-        if (-1 != fcntl(sock, F_SETFL, flags | O_NONBLOCK))
+        if (-1 != fcntl(sock, F_SETFL, flags | O_NONBLOCK)) {
             return sock;
+        }
     }
     perror("fcntl error");
 
@@ -188,7 +193,7 @@ static int udp_bind(struct sockaddr *addr, socklen_t *addrlen)
 /*
  * Catch Ctrl-C and `kill`s, make sure route table gets cleaned before this process exit
  */
-static void cleanup(int signo)
+static void cleanup (int signo)
 {
     printf("Exiting....\n");
     if (signo == SIGHUP || signo == SIGINT || signo == SIGTERM) {
@@ -197,11 +202,11 @@ static void cleanup(int signo)
     }
 }
 
-static void cleanup_when_sig_exit(void)
+static void cleanup_when_sig_exit (void)
 {
     struct sigaction sa;
     sa.sa_handler = &cleanup;
-    sa.sa_flags   = SA_RESTART;
+    sa.sa_flags = SA_RESTART;
     sigfillset(&sa.sa_mask);
 
     if (sigaction(SIGHUP, &sa, NULL) < 0) {
@@ -220,17 +225,76 @@ static void cleanup_when_sig_exit(void)
  * A comprehensive encryption is not easy and not the point for this demo
  * I'll just leave the stubs here
  */
-static void encrypt(char *plantext, char *ciphertext, int len)
+static void encrypt (char *plantext, char *ciphertext, size_t len)
 {
     memcpy(ciphertext, plantext, len);
 }
 
-static void decrypt(char *ciphertext, char *plantext, int len)
+static void decrypt (char *ciphertext, char *plantext, size_t len)
 {
     memcpy(plantext, ciphertext, len);
 }
 
-int main(int argc, char **argv)
+typedef struct {
+    int fd;
+    char buf[MTU];
+    struct sockaddr_storage clientAddr;
+    socklen_t clientAddrLen;
+} udpSettings_t;
+
+static bool tunToUdp (fd_set readSet, int tunFd, char *tunBuf, udpSettings_t udpSettings)
+{
+    if (FD_ISSET(tunFd, &readSet)) {
+        const ssize_t tunBytesRead = read(tunFd, tunBuf, MTU);
+        if (tunBytesRead < 0) {
+            // TODO: ignore some errno
+            perror("read from tunFd error");
+            return false;
+        }
+
+        encrypt(tunBuf, udpSettings.buf, tunBytesRead);
+        printf("%zu|", tunBytesRead);
+        fflush(stdout);
+
+        const ssize_t bytesWritten =
+            sendto(udpSettings.fd, udpSettings.buf, tunBytesRead, 0, (const struct sockaddr *) &udpSettings.clientAddr,
+                   udpSettings.clientAddrLen);
+        if (bytesWritten < 0) {
+            // TODO: ignore some errno
+            perror("sendto udpFd error");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool udpToTun (fd_set readSet, udpSettings_t udpSettings, int tunFd, char *tunBuf)
+{
+    if (FD_ISSET(udpSettings.fd, &readSet)) {
+        const ssize_t udpBytesRead = recvfrom(udpSettings.fd, udpSettings.buf, MTU, 0, (struct sockaddr *) &udpSettings.clientAddr,
+                                              &udpSettings.clientAddrLen);
+        if (udpBytesRead < 0) {
+            // TODO: ignore some errno
+            perror("recvfrom udp_fd error");
+            return false;
+        }
+
+        decrypt(udpSettings.buf, tunBuf, udpBytesRead);
+        printf("%zu|", udpBytesRead);
+        fflush(stdout);
+
+        const ssize_t bytesWritten = write(tunFd, tunBuf, udpBytesRead);
+        if (bytesWritten < 0) {
+            // TODO: ignore some errno
+            perror("write tun_fd error");
+            return false;
+        }
+    }
+    return true;
+}
+
+int main (int argc, char **argv)
 {
     UNUSED(argc);
     UNUSED(argv);
@@ -251,11 +315,13 @@ int main(int argc, char **argv)
     setup_route_table();
     cleanup_when_sig_exit();
 
-    int udp_fd;
-    struct sockaddr_storage client_addr;
-    socklen_t client_addrlen = sizeof(client_addr);
+    udpSettings_t udpData;
 
-    if ((udp_fd = udp_bind((struct sockaddr *) &client_addr, &client_addrlen)) < 0) {
+    udpData.clientAddrLen = sizeof(udpData.clientAddr);
+
+    udpData.fd = udp_bind((struct sockaddr *) &udpData.clientAddr, &udpData.clientAddrLen);
+    if (udpData.fd < 0) {
+        printf("Error binding UDP: %d\n", udpData.fd);
         return 1;
     }
 
@@ -263,66 +329,34 @@ int main(int argc, char **argv)
      * tun_buf - memory buffer read from/write to tun dev - is always plain
      * udp_buf - memory buffer read from/write to udp fd - is always encrypted
      */
-    char tun_buf[MTU], udp_buf[MTU];
+    char tun_buf[MTU];
     bzero(tun_buf, MTU);
-    bzero(udp_buf, MTU);
+    bzero(udpData.buf, MTU);
 
     while (true) {
-        fd_set readset;
-        FD_ZERO(&readset);
-        FD_SET(tun_fd, &readset);
-        FD_SET(udp_fd, &readset);
-        const int max_fd = max(tun_fd, udp_fd) + 1;
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(tun_fd, &readSet);
+        FD_SET(udpData.fd, &readSet);
+        const int max_fd = max(tun_fd, udpData.fd) + 1;
 
-        if (-1 == select(max_fd, &readset, NULL, NULL, NULL)) {
+        if (-1 == select(max_fd, &readSet, NULL, NULL, NULL)) {
             perror("select error");
             break;
         }
 
-        int r;
-        if (FD_ISSET(tun_fd, &readset)) {
-            r = read(tun_fd, tun_buf, MTU);
-            if (r < 0) {
-                // TODO: ignore some errno
-                perror("read from tun_fd error");
-                break;
-            }
-
-            encrypt(tun_buf, udp_buf, r);
-            printf("%d|", r);
-            fflush(stdout);
-
-            r = sendto(udp_fd, udp_buf, r, 0, (const struct sockaddr *) &client_addr, client_addrlen);
-            if (r < 0) {
-                // TODO: ignore some errno
-                perror("sendto udp_fd error");
-                break;
-            }
+        if (!tunToUdp(readSet, tun_fd, tun_buf, udpData)) {
+            printf("tunToUdp error\n");
+            break;
         }
-
-        if (FD_ISSET(udp_fd, &readset)) {
-            r = recvfrom(udp_fd, udp_buf, MTU, 0, (struct sockaddr *) &client_addr, &client_addrlen);
-            if (r < 0) {
-                // TODO: ignore some errno
-                perror("recvfrom udp_fd error");
-                break;
-            }
-
-            decrypt(udp_buf, tun_buf, r);
-            printf("%d|", r);
-            fflush(stdout);
-
-            r = write(tun_fd, tun_buf, r);
-            if (r < 0) {
-                // TODO: ignore some errno
-                perror("write tun_fd error");
-                break;
-            }
+        if (!udpToTun(readSet, udpData, tun_fd, tun_buf)) {
+            printf("udpToTun error\n");
+            break;
         }
     }
 
     close(tun_fd);
-    close(udp_fd);
+    close(udpData.fd);
 
     cleanup_route_table();
 

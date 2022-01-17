@@ -1,5 +1,5 @@
 client : vpn.c
-	gcc -o $@ $^ -g -Wall -Wextra -DAS_CLIENT -DSERVER_HOST=\"127.0.0.1\"
+	gcc -o $@ $^ -g -Wall -Wextra -DAS_CLIENT
 server : vpn.c
 	gcc -o $@ $^ -g -Wall -Wextra
 
