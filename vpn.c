@@ -21,9 +21,13 @@
 
 #if defined(AS_CLIENT)
 #define TUN_INTERFACE "tun_client"
+#define INTERFACE_ADDRESS "10.8.0.2/16"
 #else
 #define TUN_INTERFACE "tun_server"
+#define INTERFACE_ADDRESS "10.8.0.1/16"
 #endif
+
+#define UNUSED(x) (void)(x)
 
 static int max(int a, int b)
 {
@@ -35,6 +39,7 @@ static int max(int a, int b)
  */
 static int tun_alloc(void)
 {
+    printf("Creating tun interface %s\n", TUN_INTERFACE);
     struct ifreq ifr;
     int fd, e;
 
@@ -65,7 +70,7 @@ static void run(char *cmd, ...)
     char buf[1024];
     va_list args;
     va_start(args, cmd);
-    vsnprintf(buf, 1024, cmd, args);
+    vsnprintf(buf, sizeof(buf), cmd, args);
     va_end(args);
 
     printf("Execute `%s`\n", buf);
@@ -73,22 +78,6 @@ static void run(char *cmd, ...)
         perror(buf);
         exit(1);
     }
-}
-
-/*
- * Configure IP address and MTU of VPN interface /dev/tun0
- */
-static void ifconfig(void)
-{
-    printf("Running ifconfig\n");
-    char cmd[1024];
-
-#ifdef AS_CLIENT
-    snprintf(cmd, sizeof(cmd), "ifconfig %s 10.8.0.2/16 mtu %d up", TUN_INTERFACE, MTU);
-#else
-    snprintf(cmd, sizeof(cmd), "ifconfig %s 10.8.0.1/16 mtu %d up", TUN_INTERFACE, MTU);
-#endif
-    run(cmd);
 }
 
 /*
@@ -104,10 +93,7 @@ static void setup_route_table(void)
     run("iptables -t nat -A POSTROUTING -o %s -j MASQUERADE", TUN_INTERFACE);
     run("iptables -I FORWARD 1 -i %s -m state --state RELATED,ESTABLISHED -j ACCEPT", TUN_INTERFACE);
     run("iptables -I FORWARD 1 -o %s -j ACCEPT", TUN_INTERFACE);
-    char cmd[1024];
-    // default via 192.168.1.1 dev wlp111s0 proto dhcp metric 600
-    snprintf(cmd, sizeof(cmd), "ip route add %s via 192.168.1.1", SERVER_HOST);
-    run(cmd);
+    run("ip route add %s via 192.168.1.1", SERVER_HOST);
     run("ip route add 0/1 dev %s", TUN_INTERFACE);
     run("ip route add 128/1 dev %s", TUN_INTERFACE);
 #else
@@ -126,9 +112,7 @@ static void cleanup_route_table(void)
     run("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", TUN_INTERFACE);
     run("iptables -D FORWARD -i %s -m state --state RELATED,ESTABLISHED -j ACCEPT", TUN_INTERFACE);
     run("iptables -D FORWARD -o %s -j ACCEPT", TUN_INTERFACE);
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "ip route del %s", SERVER_HOST);
-    run(cmd);
+    run("ip route del %s", SERVER_HOST);
     run("ip route del 0/1");
     run("ip route del 128/1");
 #else
@@ -206,7 +190,7 @@ static int udp_bind(struct sockaddr *addr, socklen_t *addrlen)
  */
 static void cleanup(int signo)
 {
-    printf("Goodbye, cruel world....\n");
+    printf("Exiting....\n");
     if (signo == SIGHUP || signo == SIGINT || signo == SIGTERM) {
         cleanup_route_table();
         exit(0);
@@ -248,6 +232,9 @@ static void decrypt(char *ciphertext, char *plantext, int len)
 
 int main(int argc, char **argv)
 {
+    UNUSED(argc);
+    UNUSED(argv);
+
 #if defined(AS_CLIENT)
     printf("Client startup, server=%s\n", SERVER_HOST);
 #else
@@ -259,7 +246,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    ifconfig();
+    // Set interface address and MTU
+    run("ifconfig %s %s mtu %d up", TUN_INTERFACE, INTERFACE_ADDRESS, MTU);
     setup_route_table();
     cleanup_when_sig_exit();
 
@@ -301,7 +289,8 @@ int main(int argc, char **argv)
             }
 
             encrypt(tun_buf, udp_buf, r);
-            printf("Writing to UDP %d bytes ...\n", r);
+            printf("%d|", r);
+            fflush(stdout);
 
             r = sendto(udp_fd, udp_buf, r, 0, (const struct sockaddr *) &client_addr, client_addrlen);
             if (r < 0) {
@@ -320,7 +309,8 @@ int main(int argc, char **argv)
             }
 
             decrypt(udp_buf, tun_buf, r);
-            printf("Writing to tun %d bytes ...\n", r);
+            printf("%d|", r);
+            fflush(stdout);
 
             r = write(tun_fd, tun_buf, r);
             if (r < 0) {
