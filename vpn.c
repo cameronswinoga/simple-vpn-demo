@@ -1,5 +1,7 @@
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
@@ -17,6 +19,12 @@
 #define MTU       1400
 #define BIND_HOST "0.0.0.0"
 
+#if defined(AS_CLIENT)
+#define TUN_INTERFACE "tun_client"
+#else
+#define TUN_INTERFACE "tun_server"
+#endif
+
 static int max(int a, int b)
 {
     return a > b ? a : b;
@@ -25,7 +33,7 @@ static int max(int a, int b)
 /*
  * Create VPN interface /dev/tun0 and return a fd
  */
-int tun_alloc()
+static int tun_alloc(void)
 {
     struct ifreq ifr;
     int fd, e;
@@ -38,7 +46,7 @@ int tun_alloc()
     memset(&ifr, 0, sizeof(ifr));
 
     ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-    strncpy(ifr.ifr_name, "tun0", IFNAMSIZ);
+    strncpy(ifr.ifr_name, TUN_INTERFACE, IFNAMSIZ);
 
     if ((e = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0) {
         perror("ioctl[TUNSETIFF]");
@@ -52,11 +60,17 @@ int tun_alloc()
 /*
  * Execute commands
  */
-static void run(char *cmd)
+static void run(char *cmd, ...)
 {
-    printf("Execute `%s`\n", cmd);
-    if (system(cmd)) {
-        perror(cmd);
+    char buf[1024];
+    va_list args;
+    va_start(args, cmd);
+    vsnprintf(buf, 1024, cmd, args);
+    va_end(args);
+
+    printf("Execute `%s`\n", buf);
+    if (system(buf)) {
+        perror(buf);
         exit(1);
     }
 }
@@ -64,14 +78,15 @@ static void run(char *cmd)
 /*
  * Configure IP address and MTU of VPN interface /dev/tun0
  */
-void ifconfig()
+static void ifconfig(void)
 {
+    printf("Running ifconfig\n");
     char cmd[1024];
 
 #ifdef AS_CLIENT
-    snprintf(cmd, sizeof(cmd), "ifconfig tun0 10.8.0.2/16 mtu %d up", MTU);
+    snprintf(cmd, sizeof(cmd), "ifconfig %s 10.8.0.2/16 mtu %d up", TUN_INTERFACE, MTU);
 #else
-    snprintf(cmd, sizeof(cmd), "ifconfig tun0 10.8.0.1/16 mtu %d up", MTU);
+    snprintf(cmd, sizeof(cmd), "ifconfig %s 10.8.0.1/16 mtu %d up", TUN_INTERFACE, MTU);
 #endif
     run(cmd);
 }
@@ -79,19 +94,22 @@ void ifconfig()
 /*
  * Setup route table via `iptables` & `ip route`
  */
-void setup_route_table()
+static void setup_route_table(void)
 {
+    printf("Adding routing tables\n");
+
     run("sysctl -w net.ipv4.ip_forward=1");
 
 #ifdef AS_CLIENT
-    run("iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE");
-    run("iptables -I FORWARD 1 -i tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT");
-    run("iptables -I FORWARD 1 -o tun0 -j ACCEPT");
+    run("iptables -t nat -A POSTROUTING -o %s -j MASQUERADE", TUN_INTERFACE);
+    run("iptables -I FORWARD 1 -i %s -m state --state RELATED,ESTABLISHED -j ACCEPT", TUN_INTERFACE);
+    run("iptables -I FORWARD 1 -o %s -j ACCEPT", TUN_INTERFACE);
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "ip route add %s via $(ip route show 0/0 | sed -e 's/.* via \([^ ]*\).*/\1/')", SERVER_HOST);
+    // default via 192.168.1.1 dev wlp111s0 proto dhcp metric 600
+    snprintf(cmd, sizeof(cmd), "ip route add %s via 192.168.1.1", SERVER_HOST);
     run(cmd);
-    run("ip route add 0/1 dev tun0");
-    run("ip route add 128/1 dev tun0");
+    run("ip route add 0/1 dev %s", TUN_INTERFACE);
+    run("ip route add 128/1 dev %s", TUN_INTERFACE);
 #else
     run("iptables -t nat -A POSTROUTING -s 10.8.0.0/16 ! -d 10.8.0.0/16 -m comment --comment 'vpndemo' -j MASQUERADE");
     run("iptables -A FORWARD -s 10.8.0.0/16 -m state --state RELATED,ESTABLISHED -j ACCEPT");
@@ -102,12 +120,12 @@ void setup_route_table()
 /*
  * Cleanup route table
  */
-void cleanup_route_table()
+static void cleanup_route_table(void)
 {
 #ifdef AS_CLIENT
-    run("iptables -t nat -D POSTROUTING -o tun0 -j MASQUERADE");
-    run("iptables -D FORWARD -i tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT");
-    run("iptables -D FORWARD -o tun0 -j ACCEPT");
+    run("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", TUN_INTERFACE);
+    run("iptables -D FORWARD -i %s -m state --state RELATED,ESTABLISHED -j ACCEPT", TUN_INTERFACE);
+    run("iptables -D FORWARD -o %s -j ACCEPT", TUN_INTERFACE);
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "ip route del %s", SERVER_HOST);
     run(cmd);
@@ -123,11 +141,11 @@ void cleanup_route_table()
 /*
  * Bind UDP port
  */
-int udp_bind(struct sockaddr *addr, socklen_t *addrlen)
+static int udp_bind(struct sockaddr *addr, socklen_t *addrlen)
 {
     struct addrinfo hints;
     struct addrinfo *result;
-    int sock, flags;
+    int sock;
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_socktype = SOCK_DGRAM;
@@ -172,7 +190,7 @@ int udp_bind(struct sockaddr *addr, socklen_t *addrlen)
 
     freeaddrinfo(result);
 
-    flags = fcntl(sock, F_GETFL, 0);
+    const int flags = fcntl(sock, F_GETFL, 0);
     if (flags != -1) {
         if (-1 != fcntl(sock, F_SETFL, flags | O_NONBLOCK))
             return sock;
@@ -186,7 +204,7 @@ int udp_bind(struct sockaddr *addr, socklen_t *addrlen)
 /*
  * Catch Ctrl-C and `kill`s, make sure route table gets cleaned before this process exit
  */
-void cleanup(int signo)
+static void cleanup(int signo)
 {
     printf("Goodbye, cruel world....\n");
     if (signo == SIGHUP || signo == SIGINT || signo == SIGTERM) {
@@ -195,7 +213,7 @@ void cleanup(int signo)
     }
 }
 
-void cleanup_when_sig_exit()
+static void cleanup_when_sig_exit(void)
 {
     struct sigaction sa;
     sa.sa_handler = &cleanup;
@@ -218,12 +236,12 @@ void cleanup_when_sig_exit()
  * A comprehensive encryption is not easy and not the point for this demo
  * I'll just leave the stubs here
  */
-void encrypt(char *plantext, char *ciphertext, int len)
+static void encrypt(char *plantext, char *ciphertext, int len)
 {
     memcpy(ciphertext, plantext, len);
 }
 
-void decrypt(char *ciphertext, char *plantext, int len)
+static void decrypt(char *ciphertext, char *plantext, int len)
 {
     memcpy(plantext, ciphertext, len);
 }
@@ -261,12 +279,12 @@ int main(int argc, char **argv)
     bzero(tun_buf, MTU);
     bzero(udp_buf, MTU);
 
-    while (1) {
+    while (true) {
         fd_set readset;
         FD_ZERO(&readset);
         FD_SET(tun_fd, &readset);
         FD_SET(udp_fd, &readset);
-        int max_fd = max(tun_fd, udp_fd) + 1;
+        const int max_fd = max(tun_fd, udp_fd) + 1;
 
         if (-1 == select(max_fd, &readset, NULL, NULL, NULL)) {
             perror("select error");
