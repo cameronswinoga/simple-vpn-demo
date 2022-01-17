@@ -24,6 +24,7 @@
 #define INTERFACE_ADDRESS "10.8.0.2/16"
 #else
 #define BIND_HOST "0.0.0.0"
+#define SERVER_SUBNET "10.8.0.0/16"
 #define TUN_INTERFACE     "tun_server"
 #define INTERFACE_ADDRESS "10.8.0.1/16"
 #endif
@@ -95,9 +96,9 @@ static void setup_route_table (void)
     run("ip route add 128/1 dev %s", TUN_INTERFACE);
     run("ip route add 192.168.1.30/32 dev %s proto static", TUN_INTERFACE);
 #else
-    run("iptables -t nat -A POSTROUTING -s 10.8.0.0/16 ! -d 10.8.0.0/16 -m comment --comment 'vpndemo' -j MASQUERADE");
-    run("iptables -A FORWARD -s 10.8.0.0/16 -m state --state RELATED,ESTABLISHED -j ACCEPT");
-    run("iptables -A FORWARD -d 10.8.0.0/16 -j ACCEPT");
+    run("iptables -t nat -A POSTROUTING -s %s ! -d %s -m comment --comment 'vpndemo' -j MASQUERADE", SERVER_SUBNET, SERVER_SUBNET);
+    run("iptables -A FORWARD -s %s -m state --state RELATED,ESTABLISHED -j ACCEPT", SERVER_SUBNET);
+    run("iptables -A FORWARD -d %s -j ACCEPT", SERVER_SUBNET);
 #endif
 }
 
@@ -114,9 +115,9 @@ static void cleanup_route_table (void)
     run("ip route del 0/1");
     run("ip route del 128/1");
 #else
-    run("iptables -t nat -D POSTROUTING -s 10.8.0.0/16 ! -d 10.8.0.0/16 -m comment --comment 'vpndemo' -j MASQUERADE");
-    run("iptables -D FORWARD -s 10.8.0.0/16 -m state --state RELATED,ESTABLISHED -j ACCEPT");
-    run("iptables -D FORWARD -d 10.8.0.0/16 -j ACCEPT");
+    run("iptables -t nat -D POSTROUTING -s %s ! -d %s -m comment --comment 'vpndemo' -j MASQUERADE", SERVER_SUBNET, SERVER_SUBNET);
+    run("iptables -D FORWARD -s %s -m state --state RELATED,ESTABLISHED -j ACCEPT", SERVER_SUBNET);
+    run("iptables -D FORWARD -d %s -j ACCEPT", SERVER_SUBNET);
 #endif
 }
 
@@ -249,7 +250,7 @@ static bool tunToUdp (fd_set readSet, int tunFd, char *tunBuf, udpSettings_t udp
         }
 
         encrypt(tunBuf, udpSettings.buf, tunBytesRead);
-        printf("%zu|", tunBytesRead);
+        printf("%zu>", tunBytesRead);
         fflush(stdout);
 
         const ssize_t bytesWritten =
@@ -277,7 +278,7 @@ static bool udpToTun (fd_set readSet, udpSettings_t udpSettings, int tunFd, char
         }
 
         decrypt(udpSettings.buf, tunBuf, udpBytesRead);
-        printf("%zu|", udpBytesRead);
+        printf("%zu<", udpBytesRead);
         fflush(stdout);
 
         const ssize_t bytesWritten = write(tunFd, tunBuf, udpBytesRead);
