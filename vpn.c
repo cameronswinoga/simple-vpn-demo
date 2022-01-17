@@ -29,11 +29,7 @@
 #endif
 
 #define UNUSED(x) (void) (x)
-
-static int max (int a, int b)
-{
-    return a > b ? a : b;
-}
+#define MAX(a, b) a > b ? a : b
 
 /*
  * Create VPN interface /dev/tun0 and return a fd
@@ -41,20 +37,20 @@ static int max (int a, int b)
 static int tun_alloc (void)
 {
     printf("Creating tun interface %s\n", TUN_INTERFACE);
-    struct ifreq ifr;
-    int fd, e;
 
-    if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
+    const int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) {
         perror("Cannot open /dev/net/tun");
         return fd;
     }
 
-    memset(&ifr, 0, sizeof(ifr));
-
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    struct ifreq ifr = {
+        .ifr_flags = IFF_TUN | IFF_NO_PI,
+    };
     strncpy(ifr.ifr_name, TUN_INTERFACE, IFNAMSIZ);
 
-    if ((e = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0) {
+    const int e = ioctl(fd, TUNSETIFF, (void *) &ifr);
+    if (e < 0) {
         perror("ioctl[TUNSETIFF]");
         close(fd);
         return e;
@@ -129,19 +125,17 @@ static void cleanup_route_table (void)
  */
 static int udp_bind (struct sockaddr *addr, socklen_t *addrlen)
 {
-    struct addrinfo hints;
-    struct addrinfo *result;
-    int sock;
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_protocol = IPPROTO_UDP;
+    struct addrinfo hints = {
+        .ai_socktype = SOCK_DGRAM,
+        .ai_protocol = IPPROTO_UDP,
+    };
 
 #ifdef AS_CLIENT
     const char *host = SERVER_HOST;
 #else
     const char *host = BIND_HOST;
 #endif
+    struct addrinfo *result;
     if (0 != getaddrinfo(host, NULL, &hints, &result)) {
         perror("getaddrinfo error");
         return -1;
@@ -161,7 +155,8 @@ static int udp_bind (struct sockaddr *addr, socklen_t *addrlen)
     memcpy(addr, result->ai_addr, result->ai_addrlen);
     *addrlen = result->ai_addrlen;
 
-    if (-1 == (sock = socket(result->ai_family, SOCK_DGRAM, IPPROTO_UDP))) {
+    const int sock = socket(result->ai_family, SOCK_DGRAM, IPPROTO_UDP);
+    if (-1 == sock) {
         perror("Cannot create socket");
         freeaddrinfo(result);
         return -1;
@@ -204,9 +199,10 @@ static void cleanup (int signo)
 
 static void cleanup_when_sig_exit (void)
 {
-    struct sigaction sa;
-    sa.sa_handler = &cleanup;
-    sa.sa_flags = SA_RESTART;
+    struct sigaction sa = {
+        .sa_handler = &cleanup,
+        .sa_flags = SA_RESTART,
+    };
     sigfillset(&sa.sa_mask);
 
     if (sigaction(SIGHUP, &sa, NULL) < 0) {
@@ -305,8 +301,8 @@ int main (int argc, char **argv)
     printf("Server startup\n");
 #endif
 
-    int tun_fd;
-    if ((tun_fd = tun_alloc()) < 0) {
+    const int tun_fd = tun_alloc();
+    if (tun_fd < 0) {
         return 1;
     }
 
@@ -315,11 +311,10 @@ int main (int argc, char **argv)
     setup_route_table();
     cleanup_when_sig_exit();
 
-    udpSettings_t udpData;
-
-    udpData.clientAddrLen = sizeof(udpData.clientAddr);
-
-    udpData.fd = udp_bind((struct sockaddr *) &udpData.clientAddr, &udpData.clientAddrLen);
+    udpSettings_t udpData = {
+        .clientAddrLen = sizeof(udpData.clientAddr),
+        .fd = udp_bind((struct sockaddr *) &udpData.clientAddr, &udpData.clientAddrLen),
+    };
     if (udpData.fd < 0) {
         printf("Error binding UDP: %d\n", udpData.fd);
         return 1;
@@ -338,7 +333,7 @@ int main (int argc, char **argv)
         FD_ZERO(&readSet);
         FD_SET(tun_fd, &readSet);
         FD_SET(udpData.fd, &readSet);
-        const int max_fd = max(tun_fd, udpData.fd) + 1;
+        const int max_fd = MAX(tun_fd, udpData.fd) + 1;
 
         if (-1 == select(max_fd, &readSet, NULL, NULL, NULL)) {
             perror("select error");
