@@ -169,6 +169,11 @@ static bool tunToSkt(fd_set readSet, int tunFd, char *tunBuf, int sktFd, char *s
         perror("write sktFd error");
         return false;
     }
+    for (int i = 0; i < tunBytesRead; i++) {
+        printf("%02hhx", sktBuf[i]);
+    }
+    printf("\n");
+    fflush(stdout);
 
     return true;
 }
@@ -189,6 +194,7 @@ static bool sktToTun(int sktFd, char *sktBuf, int tunFd, char *tunBuf)
     if (bytesWritten < 0) {
         // TODO: ignore some errno
         perror("write tun_fd error");
+        printf("%i %i\n", tunFd, sktBytesRead);
         return false;
     }
     return true;
@@ -196,8 +202,7 @@ static bool sktToTun(int sktFd, char *sktBuf, int tunFd, char *tunBuf)
 
 int main(int argc, char **argv)
 {
-    UNUSED(argc);
-    UNUSED(argv);
+    UNUSED(argc, argv);
 
     printf("Client startup, server=%s\n", SOCKET_PATH);
 
