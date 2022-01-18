@@ -1,7 +1,9 @@
-client : vpn.c
-	gcc -o $@ $^ -g -Wall -Wextra -DAS_CLIENT
-server : vpn.c
-	gcc -o $@ $^ -g -Wall -Wextra
+CFLAGS=-Wall -Wextra
+
+client : client.c
+	gcc -o $@ $^ -g $(CFLAGS)
+server : server.c
+	gcc -o $@ $^ -g $(CFLAGS)
 
 clean :
-	rm vpn
+	rm -f client server
