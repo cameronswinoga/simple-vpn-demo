@@ -14,7 +14,6 @@
 #include <netdb.h>
 #include <netinet/in.h>    // IPPROTO_*
 #include <net/if.h>        // ifreq
-#include <linux/if_tun.h>  // IFF_TUN, IFF_NO_PI
 
 #define SERIAL_PATH "/dev/ttyS3"
 int serialFd;
@@ -162,6 +161,66 @@ static void dump_packet_ipv6(int count, char *buffer)
     dump_ports(protocol, count - 40, buffer + 40);
 }
 
+static bool serToSkt(char *serBuf, int serBufSize, int sktFd, char *sktBuf)
+{
+    const ssize_t serBytesRead = read(serialFd, serBuf, serBufSize);
+    if (serBytesRead < 0) {
+        printf("Read error: %zi\n", serBytesRead);
+        return false;
+    }
+
+    memcpy(sktBuf, serBuf, serBytesRead);
+    printf(">%zi:", serBytesRead);
+    for (int i = 0; i < serBytesRead; i++) {
+        printf("%02hhx", serBuf[i]);
+    }
+    printf("\n");
+    fflush(stdout);
+
+    unsigned char version = ((unsigned char) serBuf[0]) >> 4;
+    if (version == 4) {
+        dump_packet_ipv4(serBytesRead, serBuf);
+    }
+    else if (version == 6) {
+        dump_packet_ipv6(serBytesRead, serBuf);
+    }
+    else {
+        printf("Unknown packet version\n");
+    }
+
+    const ssize_t sktBytesWritten = write(sktFd, sktBuf, serBytesRead);
+    if (sktBytesWritten < 0) {
+        // TODO: ignore some errno
+        perror("write sktFd error");
+        return false;
+    }
+
+    return true;
+}
+
+static bool sktToSer(int sktFd, char *sktBuf, char *serBuf)
+{
+    ssize_t sktBytesRead = read(sktFd, sktBuf, 256);
+    if (sktBytesRead < 0) {
+        printf("Error reading: %zi\n", sktBytesRead);
+        return 1;
+    }
+
+    memcpy(serBuf, sktBuf, sktBytesRead);
+    printf("%zu<", sktBytesRead);
+    fflush(stdout);
+
+    const ssize_t serialBytesWritten = write(serialFd, serBuf, sktBytesRead);
+    if (serialBytesWritten < 0) {
+        // TODO: ignore some errno
+        perror("write tun_fd error");
+        printf("%i %zi\n", serialFd, sktBytesRead);
+        return false;
+    }
+
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     UNUSED(argc, argv);
@@ -176,51 +235,38 @@ int main(int argc, char **argv)
     //    unsigned char msg[] = "Hellllllllllllllllllo\n";
     //    write(serialFd, msg, sizeof(msg));
 
-    char serialBuf[1024];
-    char pktBuf[1024];
+    // Open a raw socket, no IP protocol specified
+    int ip_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (ip_fd == -1) {
+        close(serialFd);
+        perror("socket(ip_fd) error");
+        return 1;
+    }
+    int hdrincl = 1; // Enable manual header inclusion, header will not be generated for us
+    if (setsockopt(ip_fd, IPPROTO_IP, IP_HDRINCL, &hdrincl, sizeof(hdrincl)) == -1) {
+        close(serialFd);
+        perror("setsockopt(ip_fd) error");
+        return 1;
+    }
+    // Set socket as nonblocking
+    if (fcntl(ip_fd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl(ip_fd) error");
+        return 1;
+    }
 
-    int bytesInPkt = 0;
+    char serialBuf[1024];
+    char ipBuf[1024];
+
     while (true) {
-        const ssize_t numBytesRead = read(serialFd, &serialBuf, sizeof(serialBuf));
-        if (numBytesRead < 0) {
-            printf("Read error: %zi\n", numBytesRead);
+        if (!serToSkt(serialBuf, sizeof(serialBuf), ip_fd, ipBuf)) {
+            printf("serToSkt error\n");
             break;
         }
-        printf(">%zi:", numBytesRead);
-        for (int i = 0; i < numBytesRead; i++) {
-            printf("%02hhx", serialBuf[i]);
-        }
-        printf("\n");
-        fflush(stdout);
 
-        unsigned char version = ((unsigned char) serialBuf[0]) >> 4;
-        if (version == 4) {
-            dump_packet_ipv4(numBytesRead, serialBuf);
+        if (!sktToSer(ip_fd, ipBuf, serialBuf)) {
+            printf("sktToSer error\n");
+            break;
         }
-        else if (version == 6) {
-            dump_packet_ipv6(numBytesRead, serialBuf);
-        }
-        else {
-            printf("Unknown packet version\n");
-        }
-
-        //        memcpy((char *)(&pktBuf + bytesInPkt), serialBuf, numBytesRead);
-        //        bytesInPkt += (int) numBytesRead;
-        //        if (bytesInPkt < 4) {
-        //            // Not enough bytes in packet
-        //            continue;
-        //        }
-        //
-        //        typedef union {
-        //            struct {
-        //                u_int16_t flags;
-        //                u_int16_t proto;
-        //            };
-        //            u_int8_t asBytes[4];
-        //        } header_t;
-        //
-        //        bytesInPkt = 0;
-        //        bzero(pktBuf, sizeof(pktBuf));
     }
 
     close(serialFd);

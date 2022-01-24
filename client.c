@@ -123,21 +123,6 @@ static void cleanup_when_sig_exit(void)
     }
 }
 
-/*
- * For a real-world VPN, traffic inside UDP tunnel is encrypted
- * A comprehensive encryption is not easy and not the point for this demo
- * I'll just leave the stubs here
- */
-static void encrypt(char *plantext, char *ciphertext, size_t len)
-{
-    memcpy(ciphertext, plantext, len);
-}
-
-static void decrypt(char *ciphertext, char *plantext, size_t len)
-{
-    memcpy(plantext, ciphertext, len);
-}
-
 static bool tunToSkt(fd_set readSet, int tunFd, char *tunBuf, int sktFd, char *sktBuf)
 {
     if (!FD_ISSET(tunFd, &readSet)) {
@@ -151,7 +136,7 @@ static bool tunToSkt(fd_set readSet, int tunFd, char *tunBuf, int sktFd, char *s
         return false;
     }
 
-    encrypt(tunBuf, sktBuf, tunBytesRead);
+    memcpy(sktBuf, tunBuf, tunBytesRead);
     printf("%zu>", tunBytesRead);
     fflush(stdout);
 
@@ -180,7 +165,7 @@ static bool sktToTun(int sktFd, char *sktBuf, int tunFd, char *tunBuf)
         return 1;
     }
 
-    decrypt(sktBuf, tunBuf, sktBytesRead);
+    memcpy(tunBuf, sktBuf, sktBytesRead);
     printf("%zu<", sktBytesRead);
     fflush(stdout);
 
