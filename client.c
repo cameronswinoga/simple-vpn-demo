@@ -79,14 +79,9 @@ static void setup_route_table(void)
 {
     printf("Adding routing tables\n");
 
-    run("sysctl -w net.ipv4.ip_forward=1");
-
-    run("iptables -t nat -A POSTROUTING -o %s -j MASQUERADE", TUN_INTERFACE);
-    run("iptables -I FORWARD 1 -i %s -m state --state RELATED,ESTABLISHED -j ACCEPT", TUN_INTERFACE);
-    run("iptables -I FORWARD 1 -o %s -j ACCEPT", TUN_INTERFACE);
-    run("ip route add 0/1 dev %s", TUN_INTERFACE);
-    run("ip route add 128/1 dev %s", TUN_INTERFACE);
-    run("ip route add 192.168.1.30/32 dev %s proto static", TUN_INTERFACE);
+    run("ip route add 15.8.0.0/24 dev %s proto static", TUN_INTERFACE);
+    run("echo 0 > /proc/sys/net/ipv4/conf/%s/rp_filter", TUN_INTERFACE);
+    run("echo 1 > /proc/sys/net/ipv4/conf/%s/accept_local", TUN_INTERFACE);
 }
 
 /*
@@ -94,11 +89,7 @@ static void setup_route_table(void)
  */
 static void cleanup_route_table(void)
 {
-    run("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", TUN_INTERFACE);
-    run("iptables -D FORWARD -i %s -m state --state RELATED,ESTABLISHED -j ACCEPT", TUN_INTERFACE);
-    run("iptables -D FORWARD -o %s -j ACCEPT", TUN_INTERFACE);
-    run("ip route del 0/1");
-    run("ip route del 128/1");
+    // Routes automatically get deleted when interface is deleted
 }
 
 /*
@@ -150,6 +141,7 @@ static void decrypt(char *ciphertext, char *plantext, size_t len)
 static bool tunToSkt(fd_set readSet, int tunFd, char *tunBuf, int sktFd, char *sktBuf)
 {
     if (!FD_ISSET(tunFd, &readSet)) {
+        printf("tunToSkt: FD not set: %i\n", tunFd);
         return true;
     }
     const ssize_t tunBytesRead = read(tunFd, tunBuf, MTU);
@@ -180,7 +172,9 @@ static bool tunToSkt(fd_set readSet, int tunFd, char *tunBuf, int sktFd, char *s
 
 static bool sktToTun(int sktFd, char *sktBuf, int tunFd, char *tunBuf)
 {
+    printf("sktToTun: Start read()\n");
     ssize_t sktBytesRead = read(sktFd, sktBuf, 256);
+    printf("sktToTun: done read()\n");
     if (sktBytesRead < 0) {
         printf("Error reading: %zi\n", sktBytesRead);
         return 1;
@@ -190,11 +184,13 @@ static bool sktToTun(int sktFd, char *sktBuf, int tunFd, char *tunBuf)
     printf("%zu<", sktBytesRead);
     fflush(stdout);
 
+    printf("sktToTun: Start write()\n");
     const ssize_t bytesWritten = write(tunFd, tunBuf, sktBytesRead);
+    printf("sktToTun: done write()\n");
     if (bytesWritten < 0) {
         // TODO: ignore some errno
         perror("write tun_fd error");
-        printf("%i %i\n", tunFd, sktBytesRead);
+        printf("%i %zi\n", tunFd, sktBytesRead);
         return false;
     }
     return true;
@@ -208,6 +204,11 @@ int main(int argc, char **argv)
 
     const int tun_fd = tun_alloc();
     if (tun_fd < 0) {
+        return 1;
+    }
+    // Set tun as nonblocking
+    if (fcntl(tun_fd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl(tun_fd) error");
         return 1;
     }
 
@@ -225,6 +226,12 @@ int main(int argc, char **argv)
         .sun_family = AF_UNIX,
         .sun_path   = SOCKET_PATH,
     };
+
+    // Set socket as nonblocking
+    if (fcntl(skt_fd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl(skt_fd) error");
+        return 1;
+    }
     if (connect(skt_fd, (struct sockaddr *) &address, sizeof(struct sockaddr_un)) != 0) {
         printf("connect() failed\n");
         return 1;
@@ -245,19 +252,23 @@ int main(int argc, char **argv)
         FD_SET(tun_fd, &readSet);
         const int max_fd = tun_fd + 1;
 
+        printf("Start select\n");
         if (-1 == select(max_fd, &readSet, NULL, NULL, NULL)) {
             perror("select error");
             break;
         }
 
+        printf("Start tunToSkt\n");
         if (!tunToSkt(readSet, tun_fd, tun_buf, skt_fd, skt_buf)) {
             printf("tunToSkt error\n");
             break;
         }
+        printf("Start sktToTun\n");
         if (!sktToTun(skt_fd, skt_buf, tun_fd, tun_buf)) {
             printf("sktToTun error\n");
             break;
         }
+        printf("Done\n");
     }
 
     close(tun_fd);
