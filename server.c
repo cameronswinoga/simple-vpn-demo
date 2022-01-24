@@ -1,105 +1,111 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <termios.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <unistd.h>
+#include <stdint.h>
 #include <string.h>
-#include <signal.h>
-#include <sys/file.h>
+#include <winsock2.h>
+#include <windows.h>
 
 #include "common.h"
 
-#include <netdb.h>
-#include <netinet/in.h>    // IPPROTO_*
-#include <net/if.h>        // ifreq
+#define SERIAL_PATH "\\\\.\\COM3"
+HANDLE hComm;
+volatile bool done = false;
 
-#define SERIAL_PATH "/dev/ttyS3"
-int serialFd;
-
-static void cleanup(int signo)
+static BOOL WINAPI cleanup(DWORD signo)
 {
-    printf("Exiting....\n");
-    if (signo == SIGHUP || signo == SIGINT || signo == SIGTERM) {
-        close(serialFd);
-        exit(0);
+    if (signo == CTRL_C_EVENT) {
+        printf("Exiting.... %lu\n", signo);
+        CloseHandle(hComm);
+        done = true;
+        return TRUE;
     }
+    return FALSE;  // Not handled
 }
 
-static void cleanup_when_sig_exit(void)
+static bool cleanup_when_sig_exit(void)
 {
-    struct sigaction sa = {
-        .sa_handler = &cleanup,
-        .sa_flags   = SA_RESTART,
+    if (!SetConsoleCtrlHandler(cleanup, TRUE)) {
+        printf("\nERROR: Could not set control handler");
+        return false;
+    }
+    return true;
+}
+
+static bool openSerialPort(char *portPath, HANDLE *serialHandle)
+{
+    *serialHandle = CreateFileA(portPath, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (*serialHandle == INVALID_HANDLE_VALUE) {
+        printf("CreateFileA error: %s\n", portPath);
+        return false;
+    }
+
+    // Flush away any bytes previously read or written.
+    if (!FlushFileBuffers(*serialHandle)) {
+        printf("Failed to flush serial port\n");
+        CloseHandle(*serialHandle);
+        return false;
+    }
+
+    // Configure read and write operations to time out after 100 ms.
+    COMMTIMEOUTS timeouts = {
+        .ReadIntervalTimeout         = 0,
+        .ReadTotalTimeoutConstant    = 100,
+        .ReadTotalTimeoutMultiplier  = 0,
+        .WriteTotalTimeoutConstant   = 100,
+        .WriteTotalTimeoutMultiplier = 0,
     };
-    sigfillset(&sa.sa_mask);
 
-    if (sigaction(SIGHUP, &sa, NULL) < 0) {
-        perror("Cannot handle SIGHUP");
-    }
-    if (sigaction(SIGINT, &sa, NULL) < 0) {
-        perror("Cannot handle SIGINT");
-    }
-    if (sigaction(SIGTERM, &sa, NULL) < 0) {
-        perror("Cannot handle SIGTERM");
-    }
-}
-
-static bool openSerialPort(char *portPath, int *serial_fd, int vmin, int vtime)
-{
-    *serial_fd = open(portPath, O_RDWR);
-    if (*serial_fd < 0) {
-        printf("Error %i from open: %s\n", errno, strerror(errno));
-        return false;
-    }
-    if (flock(*serial_fd, LOCK_EX | LOCK_NB) == -1) {
-        printf("%s already locked by another process", portPath);
+    if (!SetCommTimeouts(*serialHandle, &timeouts)) {
+        printf("Failed to set serial timeouts\n");
+        CloseHandle(*serialHandle);
         return false;
     }
 
-    struct termios tty;
-    if (tcgetattr(*serial_fd, &tty) != 0) {
-        printf("Error %i from tcgetattr: %s\n", errno, strerror(errno));
+    // Set the baud rate and other options.
+    DCB state = {
+        .DCBlength = sizeof(DCB),
+        .BaudRate  = 115200,
+        .ByteSize  = 8,
+        .Parity    = NOPARITY,
+        .StopBits  = ONESTOPBIT,
+    };
+    if (!SetCommState(*serialHandle, &state)) {
+        printf("Failed to set serial settings\n");
+        CloseHandle(*serialHandle);
         return false;
     }
-    tty.c_cflag &= ~PARENB;  // No parity
-    tty.c_cflag &= ~CSTOPB;  // No stop bit
-    tty.c_cflag &= ~CSIZE;
-    tty.c_cflag |= CS8;             // 8 bpb
-    tty.c_cflag &= ~CRTSCTS;        // Disable HW flow control
-    tty.c_cflag |= CREAD | CLOCAL;  // Turn on READ & ignore ctrl lines
-
-    tty.c_lflag &= ~ICANON;  // Non-cannonical mode
-    tty.c_lflag &= ~ECHO;    // Disable echo
-    tty.c_lflag &= ~ECHOE;   // Disable erasure
-    tty.c_lflag &= ~ECHONL;  // Disable new-line echo
-    tty.c_lflag &= ~ISIG;    // Disable interpretation of INTR, QUIT and SUSP
-
-    tty.c_iflag &= ~(IXON | IXOFF | IXANY);                                       // Turn off SW flow ctrl
-    tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);  // Disable any special handling of received bytes
-
-    tty.c_oflag &= ~OPOST;  // Prevent special interpretation of output bytes (e.g. newline chars)
-    tty.c_oflag &= ~ONLCR;  // Prevent conversion of newline to carriage return/line feed
-
-    tty.c_cc[VMIN]  = vmin;
-    tty.c_cc[VTIME] = vtime;
-
-    // TODO: Cant set baud for whatever reason
-    //    cfsetspeed(&tty, B921600); // Set baud
-
-    if (tcsetattr(*serial_fd, TCSANOW, &tty) != 0) {
-        printf("Error %i from tcsetattr: %s\n", errno, strerror(errno));
-        return false;
-    }
-    printf("Opened %s\n", portPath);
 
     return true;
 }
 
+static int write_port(HANDLE port, uint8_t *buffer, size_t size)
+{
+    DWORD bytesWritten;
+    if (!WriteFile(port, buffer, size, &bytesWritten, NULL)) {
+        printf("Failed to write to port\n");
+        return -1;
+    }
+    if (bytesWritten != size) {
+        printf("Failed to write all bytes to port %lu!=%zu\n", bytesWritten, size);
+        return -1;
+    }
+    return bytesWritten;
+}
+
+static SSIZE_T read_port(HANDLE port, char *buffer, size_t size)
+{
+    DWORD bytesRead;
+    if (!ReadFile(port, buffer, size, &bytesRead, NULL)) {
+        printf("Failed to read from port\n");
+        return -1;
+    }
+    return bytesRead;
+}
+
 static void hex(char *source, char *dest, ssize_t count)
 {
-    bzero(dest, count);
+    memset(dest, 0, count);
     for (ssize_t i = 0; i < count; ++i) {
         sprintf(dest + (i * 2), "%02hhx", source[i]);
     }
@@ -107,7 +113,7 @@ static void hex(char *source, char *dest, ssize_t count)
 
 static void dump_ports(int protocol, int count, const char *buffer)
 {
-    if (!ARG_IN_LIST(protocol, IPPROTO_UDP, IPPROTO_UDPLITE, IPPROTO_TCP) || count < 4) {
+    if (!ARG_IN_LIST(protocol, IPPROTO_UDP, IPPROTO_TCP) || count < 4) {
         printf("Can't dump ports: %i %i\n", protocol, count);
         return;
     }
@@ -163,10 +169,13 @@ static void dump_packet_ipv6(int count, char *buffer)
 
 static bool serToSkt(char *serBuf, int serBufSize, int sktFd, char *sktBuf)
 {
-    const ssize_t serBytesRead = read(serialFd, serBuf, serBufSize);
+    const SSIZE_T serBytesRead = read_port(hComm, serBuf, serBufSize);
     if (serBytesRead < 0) {
         printf("Read error: %zi\n", serBytesRead);
         return false;
+    }
+    else if (serBytesRead == 0) {
+        return true;  // No data
     }
 
     memcpy(sktBuf, serBuf, serBytesRead);
@@ -188,88 +197,89 @@ static bool serToSkt(char *serBuf, int serBufSize, int sktFd, char *sktBuf)
         printf("Unknown packet version\n");
     }
 
-    const ssize_t sktBytesWritten = write(sktFd, sktBuf, serBytesRead);
-    if (sktBytesWritten < 0) {
-        // TODO: ignore some errno
-        perror("write sktFd error");
-        return false;
-    }
+    //    const ssize_t sktBytesWritten = write(sktFd, sktBuf, serBytesRead);
+    //    if (sktBytesWritten < 0) {
+    //        // TODO: ignore some errno
+    //        perror("write sktFd error");
+    //        return false;
+    //    }
 
     return true;
 }
 
-static bool sktToSer(int sktFd, char *sktBuf, char *serBuf)
-{
-    ssize_t sktBytesRead = read(sktFd, sktBuf, 256);
-    if (sktBytesRead < 0) {
-        printf("Error reading: %zi\n", sktBytesRead);
-        return 1;
-    }
-
-    memcpy(serBuf, sktBuf, sktBytesRead);
-    printf("%zu<", sktBytesRead);
-    fflush(stdout);
-
-    const ssize_t serialBytesWritten = write(serialFd, serBuf, sktBytesRead);
-    if (serialBytesWritten < 0) {
-        // TODO: ignore some errno
-        perror("write tun_fd error");
-        printf("%i %zi\n", serialFd, sktBytesRead);
-        return false;
-    }
-
-    return true;
-}
+// static bool sktToSer(int sktFd, char *sktBuf, char *serBuf)
+//{
+//     ssize_t sktBytesRead = read(sktFd, sktBuf, 256);
+//     if (sktBytesRead < 0) {
+//         printf("Error reading: %zi\n", sktBytesRead);
+//         return 1;
+//     }
+//
+//     memcpy(serBuf, sktBuf, sktBytesRead);
+//     printf("%zu<", sktBytesRead);
+//     fflush(stdout);
+//
+//     const ssize_t serialBytesWritten = write(serialFd, serBuf, sktBytesRead);
+//     if (serialBytesWritten < 0) {
+//         // TODO: ignore some errno
+//         perror("write tun_fd error");
+//         printf("%i %zi\n", serialFd, sktBytesRead);
+//         return false;
+//     }
+//
+//     return true;
+// }
 
 int main(int argc, char **argv)
 {
     UNUSED(argc, argv);
 
-    cleanup_when_sig_exit();
+    if (!cleanup_when_sig_exit()) {
+        return 1;
+    }
 
     printf("Server startup: %s\n", SERIAL_PATH);
-    if (!openSerialPort(SERIAL_PATH, &serialFd, 1, 0)) {
-        close(serialFd);
-        return 1;
-    }
-    //    unsigned char msg[] = "Hellllllllllllllllllo\n";
-    //    write(serialFd, msg, sizeof(msg));
-
-    // Open a raw socket, no IP protocol specified
-    int ip_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (ip_fd == -1) {
-        close(serialFd);
-        perror("socket(ip_fd) error");
-        return 1;
-    }
-    int hdrincl = 1; // Enable manual header inclusion, header will not be generated for us
-    if (setsockopt(ip_fd, IPPROTO_IP, IP_HDRINCL, &hdrincl, sizeof(hdrincl)) == -1) {
-        close(serialFd);
-        perror("setsockopt(ip_fd) error");
-        return 1;
-    }
-    // Set socket as nonblocking
-    if (fcntl(ip_fd, F_SETFL, O_NONBLOCK) < 0) {
-        perror("fcntl(ip_fd) error");
+    if (!openSerialPort(SERIAL_PATH, &hComm)) {
+        CloseHandle(hComm);
         return 1;
     }
 
+    //    // Open a raw socket, no IP protocol specified
+    //    int ip_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    //    if (ip_fd == -1) {
+    //        close(serialFd);
+    //        perror("socket(ip_fd) error");
+    //        return 1;
+    //    }
+    //    int hdrincl = 1; // Enable manual header inclusion, header will not be generated for us
+    //    if (setsockopt(ip_fd, IPPROTO_IP, IP_HDRINCL, &hdrincl, sizeof(hdrincl)) == -1) {
+    //        close(serialFd);
+    //        perror("setsockopt(ip_fd) error");
+    //        return 1;
+    //    }
+    //    // Set socket as nonblocking
+    //    if (fcntl(ip_fd, F_SETFL, O_NONBLOCK) < 0) {
+    //        perror("fcntl(ip_fd) error");
+    //        return 1;
+    //    }
+    //
     char serialBuf[1024];
     char ipBuf[1024];
 
-    while (true) {
-        if (!serToSkt(serialBuf, sizeof(serialBuf), ip_fd, ipBuf)) {
+    while (!done) {
+        if (!serToSkt(serialBuf, sizeof(serialBuf), 0, ipBuf)) {
             printf("serToSkt error\n");
             break;
         }
 
-        if (!sktToSer(ip_fd, ipBuf, serialBuf)) {
-            printf("sktToSer error\n");
-            break;
-        }
+        //            if (!sktToSer(ip_fd, ipBuf, serialBuf)) {
+        //                printf("sktToSer error\n");
+        //                break;
+        //            }
     }
 
-    close(serialFd);
+    CloseHandle(hComm);
 
+    printf("Server stop\n");
     return 0;
 }
