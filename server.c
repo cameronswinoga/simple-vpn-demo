@@ -111,63 +111,85 @@ static void hex(char *source, char *dest, ssize_t count)
     }
 }
 
-static void dump_ports(int protocol, int count, const char *buffer)
+static bool parsePorts(int protocol, int count, const char *buffer, uint16_t *srcPort, uint16_t *dstPort)
 {
     if (!ARG_IN_LIST(protocol, IPPROTO_UDP, IPPROTO_TCP) || count < 4) {
         printf("Can't dump ports: %i %i\n", protocol, count);
-        return;
+        return false;
     }
-    uint16_t source_port;
-    memcpy(&source_port, buffer, 2);
-    source_port = htons(source_port);
-    uint16_t dest_port;
-    memcpy(&dest_port, buffer + 2, 2);
-    dest_port = htons(dest_port);
-    printf(" sport=%u, dport=%d\n", (unsigned) source_port, (unsigned) dest_port);
+    memcpy(srcPort, buffer, 2);
+    *srcPort = htons(*srcPort);
+    memcpy(dstPort, buffer + 2, 2);
+    *dstPort = htons(*dstPort);
+    return true;
 }
 
-static void dump_packet_ipv4(int count, char *buffer)
+static bool parseIpv4Pkt(int count, char *buffer, uint32_t *dstIpPtr, uint16_t *dstPortPtr)
 {
     if (count < 20) {
         printf("IPv4 packet too short\n");
-        return;
+        return false;
     }
 
-    const int protocol              = (unsigned char) buffer[9];
-    struct protoent *protocol_entry = getprotobynumber(protocol);
+    typedef struct {
+        union {
+            uint8_t arr[4];
+            uint32_t lon;
+        } u;
+    } Ipv4Addr;
 
     const unsigned ttl = (unsigned char) buffer[8];
+    const int protocol = (unsigned char) buffer[9];
+    Ipv4Addr srcIp;
+    memcpy(&srcIp, buffer + 12, sizeof srcIp);
+    Ipv4Addr dstIp;
+    memcpy(&dstIp, buffer + 16, sizeof dstIp);
+    *dstIpPtr = dstIp.u.lon;
 
-    printf("IPv4: src=%u.%u.%u.%u dst=%u.%u.%u.%u proto=%u(%s) ttl=%u\n", (unsigned char) buffer[12], (unsigned char) buffer[13],
-           (unsigned char) buffer[14], (unsigned char) buffer[15], (unsigned char) buffer[16], (unsigned char) buffer[17],
-           (unsigned char) buffer[18], (unsigned char) buffer[19], (unsigned) protocol,
-           protocol_entry == NULL ? "?" : protocol_entry->p_name, ttl);
-    dump_ports(protocol, count - 20, buffer + 20);
+    uint16_t srcPort      = 0;
+    const bool validPorts = parsePorts(protocol, count - 20, buffer + 20, &srcPort, dstPortPtr);
+
+    struct protoent *protocol_entry = getprotobynumber(protocol);
+    printf("IPv4: src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u proto=%u(%s) ttl=%u\n", srcIp.u.arr[0], srcIp.u.arr[1], srcIp.u.arr[2],
+           srcIp.u.arr[3], srcPort, dstIp.u.arr[0], dstIp.u.arr[1], dstIp.u.arr[2], dstIp.u.arr[3], *dstPortPtr,
+           (unsigned) protocol, protocol_entry == NULL ? "?" : protocol_entry->p_name, ttl);
+
+    if (!validPorts) {
+        return false;
+    }
+    return true;
 }
 
-static void dump_packet_ipv6(int count, char *buffer)
+static bool parseIpv6Pkt(int count, char *buffer)
 {
     if (count < 40) {
         printf("IPv6 packet too short\n");
-        return;
+        return false;
     }
 
-    const int protocol              = (unsigned char) buffer[6];
-    struct protoent *protocol_entry = getprotobynumber(protocol);
-
-    char source_address[33];
-    hex(buffer + 8, source_address, 16);
-    char destination_address[33];
-    hex(buffer + 24, destination_address, 16);
-
+    const int protocol  = (unsigned char) buffer[6];
     const int hop_limit = (unsigned char) buffer[7];
 
-    printf("IPv6: src=%s dst=%s proto=%u(%s) hop_limit=%i\n", source_address, destination_address, (unsigned) protocol,
+    char source_address[33];
+    hex(buffer + 8 + 0, source_address, 16);
+    char destination_address[33];
+    hex(buffer + 8 + 16, destination_address, 16);
+
+    uint16_t srcPort      = 0;
+    uint16_t dstPort      = 0;
+    const bool validPorts = parsePorts(protocol, count - 40, buffer + 40, &srcPort, &dstPort);
+
+    struct protoent *protocol_entry = getprotobynumber(protocol);
+    printf("IPv6: src=%s:%u dst=%s:%u proto=%i(%s) hop_limit=%i\n", source_address, srcPort, destination_address, dstPort, protocol,
            protocol_entry == NULL ? "?" : protocol_entry->p_name, hop_limit);
-    dump_ports(protocol, count - 40, buffer + 40);
+
+    if (!validPorts) {
+        return false;
+    }
+    return true;
 }
 
-static bool serToSkt(char *serBuf, int serBufSize, int sktFd, char *sktBuf)
+static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
 {
     const SSIZE_T serBytesRead = read_port(hComm, serBuf, serBufSize);
     if (serBytesRead < 0) {
@@ -187,22 +209,33 @@ static bool serToSkt(char *serBuf, int serBufSize, int sktFd, char *sktBuf)
     fflush(stdout);
 
     unsigned char version = ((unsigned char) serBuf[0]) >> 4;
+    uint32_t dstIp;
+    uint16_t dstPort;
     if (version == 4) {
-        dump_packet_ipv4(serBytesRead, serBuf);
+        if (!parseIpv4Pkt(serBytesRead, serBuf, &dstIp, &dstPort)) {
+            return true;
+        }
     }
     else if (version == 6) {
-        dump_packet_ipv6(serBytesRead, serBuf);
+        parseIpv6Pkt(serBytesRead, serBuf);
+        return true;  // IPv6 not handled yet
     }
     else {
         printf("Unknown packet version\n");
     }
 
-    //    const ssize_t sktBytesWritten = write(sktFd, sktBuf, serBytesRead);
-    //    if (sktBytesWritten < 0) {
-    //        // TODO: ignore some errno
-    //        perror("write sktFd error");
-    //        return false;
-    //    }
+    // send the pkt
+    struct sockaddr_in dest = {
+        .sin_family      = AF_INET,
+        .sin_addr.s_addr = dstIp,
+        .sin_port        = htons(dstPort),
+    };
+    printf("Sending %lli bytes\n", serBytesRead);
+    const int sktBytesSent = sendto(sktFd, sktBuf, serBytesRead, 0, (struct sockaddr *) &dest, sizeof(dest));
+    if (sktBytesSent == SOCKET_ERROR) {
+        printf("sendto failed\n");
+        return false;
+    }
 
     return true;
 }
@@ -244,30 +277,33 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    //    // Open a raw socket, no IP protocol specified
-    //    int ip_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    //    if (ip_fd == -1) {
-    //        close(serialFd);
-    //        perror("socket(ip_fd) error");
-    //        return 1;
-    //    }
-    //    int hdrincl = 1; // Enable manual header inclusion, header will not be generated for us
-    //    if (setsockopt(ip_fd, IPPROTO_IP, IP_HDRINCL, &hdrincl, sizeof(hdrincl)) == -1) {
-    //        close(serialFd);
-    //        perror("setsockopt(ip_fd) error");
-    //        return 1;
-    //    }
-    //    // Set socket as nonblocking
-    //    if (fcntl(ip_fd, F_SETFL, O_NONBLOCK) < 0) {
-    //        perror("fcntl(ip_fd) error");
-    //        return 1;
-    //    }
-    //
+    // Initialize winsock2
+    struct WSAData wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != NO_ERROR) {
+        printf("WSAStartup failed\n");
+        return 1;
+    }
+
+    // Open UDP socket, since we don't have admin privileges
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) {
+        printf("Socket invalid\n");
+    }
+    // bind to the local address
+    struct sockaddr_in local = {
+        .sin_family      = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,  // Any source IP (Only for IPv4!)
+        .sin_port        = 0,           // Any source port
+    };
+    if (bind(s, (struct sockaddr *) &local, sizeof(local)) != 0) {
+        printf("bind failed\n");
+    }
+
     char serialBuf[1024];
     char ipBuf[1024];
 
     while (!done) {
-        if (!serToSkt(serialBuf, sizeof(serialBuf), 0, ipBuf)) {
+        if (!serToSkt(serialBuf, sizeof(serialBuf), s, ipBuf)) {
             printf("serToSkt error\n");
             break;
         }
