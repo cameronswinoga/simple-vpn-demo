@@ -3,33 +3,14 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-
 #include <winsock2.h>
 #include <windows.h>
-#include <tchar.h>
-#include "libpcap/pcap/pcap.h"
 
 #include "common.h"
 
 #define SERIAL_PATH "\\\\.\\COM3"
 HANDLE hComm;
 volatile bool done = false;
-
-static bool LoadNpcapDlls(void)
-{
-    _TCHAR npcap_dir[512];
-    UINT len = GetSystemDirectory(npcap_dir, 480);
-    if (!len) {
-        fprintf(stderr, "Error in GetSystemDirectory: %lux", GetLastError());
-        return false;
-    }
-    _tcscat_s(npcap_dir, 512, _T("\\Npcap"));
-    if (SetDllDirectory(npcap_dir) == 0) {
-        fprintf(stderr, "Error in SetDllDirectory: %lux", GetLastError());
-        return false;
-    }
-    return true;
-}
 
 static BOOL WINAPI cleanup(DWORD signo)
 {
@@ -208,7 +189,7 @@ static bool parseIpv6Pkt(int count, char *buffer)
     return true;
 }
 
-static bool serToSkt(char *serBuf, int serBufSize, pcap_t *pcapDev, char *sktBuf)
+static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
 {
     const SSIZE_T serBytesRead = read_port(hComm, serBuf, serBufSize);
     if (serBytesRead < 0) {
@@ -243,12 +224,18 @@ static bool serToSkt(char *serBuf, int serBufSize, pcap_t *pcapDev, char *sktBuf
         printf("Unknown packet version\n");
     }
 
-//    printf("Sending %lli bytes\n", serBytesRead);
-//    const int sktBytesSent = pcap_inject(pcapDev, (u_char *) sktBuf, (int) serBytesRead);
-//    if (sktBytesSent < 0) {
-//        printf("pcap_sendpacket failed\n");
-//        return false;
-//    }
+    // send the pkt
+    struct sockaddr_in dest = {
+        .sin_family      = AF_INET,
+        .sin_addr.s_addr = dstIp,
+        .sin_port        = htons(dstPort),
+    };
+    printf("Sending %lli bytes\n", serBytesRead);
+    const int sktBytesSent = sendto(sktFd, sktBuf, serBytesRead, 0, (struct sockaddr *) &dest, sizeof(dest));
+    if (sktBytesSent == SOCKET_ERROR) {
+        printf("sendto failed\n");
+        return false;
+    }
 
     return true;
 }
@@ -280,8 +267,6 @@ int main(int argc, char **argv)
 {
     UNUSED(argc, argv);
 
-    char pcapErrBuf[PCAP_ERRBUF_SIZE];
-
     if (!cleanup_when_sig_exit()) {
         return 1;
     }
@@ -292,51 +277,33 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Load Npcap and its functions. */
-    if (!LoadNpcapDlls()) {
-        printf("Couldn't load Npcap\n");
-        return 1;
-    }
-    printf("Loaded Ncap Dlls\n");
-
-    pcap_if_t *alldevs;
-    if (pcap_findalldevs(&alldevs, pcapErrBuf) == -1) {
-        printf("Error in pcap_findalldevs: %s\n", pcapErrBuf);
+    // Initialize winsock2
+    struct WSAData wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != NO_ERROR) {
+        printf("WSAStartup failed\n");
         return 1;
     }
 
-    printf("Available network adapters:\n");
-    for (pcap_if_t *d = alldevs; d; d = d->next) {
-        printf("%s\n", d->name);
-        printf("\tDescription: %s\n", d->description == NULL ? "No description available" : d->description);
-        printf("\tFlags: 0x%x\n", d->flags);
-        if (d->addresses != NULL) {
-            struct in_addr ifAddr = ((struct sockaddr_in *) d->addresses->addr)->sin_addr;
-            printf("\tAddress: %u.%u.%u.%u\n", ifAddr.S_un.S_un_b.s_b1, ifAddr.S_un.S_un_b.s_b2, ifAddr.S_un.S_un_b.s_b3,
-                   ifAddr.S_un.S_un_b.s_b4);
-        }
-        else {
-            printf("\tAddress: none\n");
-        }
+    // Open UDP socket, since we don't have admin privileges
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) {
+        printf("Socket invalid\n");
+    }
+    // bind to the local address
+    struct sockaddr_in local = {
+        .sin_family      = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,  // Any source IP (Only for IPv4!)
+        .sin_port        = 0,           // Any source port
+    };
+    if (bind(s, (struct sockaddr *) &local, sizeof(local)) != 0) {
+        printf("bind failed\n");
     }
 
-    const char *devName = "\\Device\\NPF_{CB7DCA69-509C-4B9B-9967-4101F20E13CF}";
-    const int snapLen   = 100;  // portion of the packet to capture
-    const int pcapFlags = 0;
-    const int timeoutMs = 100;
-
-    pcap_t *pcapDev = pcap_open_live(devName, snapLen, pcapFlags, timeoutMs, pcapErrBuf);
-    if (pcapDev == NULL) {
-        printf("Pcap failed to open device: %s\n", pcapErrBuf);
-        return 1;
-    }
-    printf("Opened %s\n", devName);
-
-    char serBuf[1024];
-    char sktBuf[1024];
+    char serialBuf[1024];
+    char ipBuf[1024];
 
     while (!done) {
-        if (!serToSkt(serBuf, sizeof(serBuf), pcapDev, sktBuf)) {
+        if (!serToSkt(serialBuf, sizeof(serialBuf), s, ipBuf)) {
             printf("serToSkt error\n");
             break;
         }
