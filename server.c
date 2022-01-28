@@ -3,7 +3,9 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 
 #include "common.h"
@@ -124,6 +126,36 @@ static bool parsePorts(int protocol, int count, const char *buffer, uint16_t *sr
     return true;
 }
 
+static uint16_t ip_checksum(void *vdata, size_t length)
+{
+
+    char *data   = (char *) vdata;  // Cast the data pointer to one that can be indexed
+    uint32_t acc = 0xffff;          // Initialise the accumulator
+
+    // Handle complete 16-bit blocks.
+    for (size_t i = 0; i + 1 < length; i += 2) {
+        uint16_t word;
+        memcpy(&word, data + i, 2);
+        acc += ntohs(word);
+        if (acc > 0xffff) {
+            acc -= 0xffff;
+        }
+    }
+
+    // Handle any partial block at the end of the data.
+    if (length & 0x01) {
+        uint16_t word = 0;
+        memcpy(&word, data + length - 1, 1);
+        acc += ntohs(word);
+        if (acc > 0xffff) {
+            acc -= 0xffff;
+        }
+    }
+
+    // Return the checksum in network byte order.
+    return htons(~acc);
+}
+
 static bool parseIpv4Pkt(int count, char *buffer, uint32_t *dstIpPtr, uint16_t *dstPortPtr)
 {
     if (count < 20) {
@@ -200,6 +232,32 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
         return true;  // No data
     }
 
+    // Disable flags?
+    serBuf[6] = serBuf[6] & 0b00011111;
+
+    // Modify the source address? Yes, need to
+    serBuf[12] = 10;
+    serBuf[13] = 56;
+    serBuf[14] = 99;
+    serBuf[15] = 4;
+
+    char chkSumBuf[20];
+    memcpy(chkSumBuf, serBuf, sizeof(chkSumBuf));
+    chkSumBuf[10]         = 0;
+    chkSumBuf[11]         = 0;
+    const uint16_t chkSum = ip_checksum(chkSumBuf, 20);
+    serBuf[10]            = (char) (chkSum >> 0);
+    serBuf[11]            = (char) (chkSum >> 8);
+
+
+    // Modify source port?
+    serBuf[20 + 1] = (char) (49902 >> 0);
+    serBuf[20 + 0] = (char) (49902 >> 8);
+    // TODO: Add dynamic UDP checksum
+    serBuf[20 + 6] = (char) 0x5d; // Checksum for 'y\n'
+    serBuf[20 + 7] = (char) 0xfa;
+
+    // Copy the buffer from serial to socket
     memcpy(sktBuf, serBuf, serBytesRead);
     printf(">%zi:", serBytesRead);
     for (int i = 0; i < serBytesRead; i++) {
@@ -217,7 +275,7 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
         }
     }
     else if (version == 6) {
-        parseIpv6Pkt(serBytesRead, serBuf);
+        //        parseIpv6Pkt(serBytesRead, serBuf);
         return true;  // IPv6 not handled yet
     }
     else {
@@ -233,9 +291,13 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
     printf("Sending %lli bytes\n", serBytesRead);
     const int sktBytesSent = sendto(sktFd, sktBuf, serBytesRead, 0, (struct sockaddr *) &dest, sizeof(dest));
     if (sktBytesSent == SOCKET_ERROR) {
-        printf("sendto failed\n");
+        wchar_t *sBuf = NULL;
+        FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+                       WSAGetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPWSTR) &sBuf, 0, NULL);
+        printf("send failed %i: %S\n", WSAGetLastError(), sBuf);
         return false;
     }
+    printf("Sent %i\n", sktBytesSent);
 
     return true;
 }
@@ -284,10 +346,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // Open UDP socket, since we don't have admin privileges
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    // Open raw socket
+    SOCKET s = socket(AF_INET, SOCK_RAW, IPPROTO_IP);
     if (s == INVALID_SOCKET) {
         printf("Socket invalid\n");
+    }
+    int optval = 1;
+    if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, (char *) &optval, sizeof(optval)) == SOCKET_ERROR) {
+        printf("setsockopt IP_HDRINCL failed\n");
+        return 1;
     }
     // bind to the local address
     struct sockaddr_in local = {
@@ -298,6 +365,15 @@ int main(int argc, char **argv)
     if (bind(s, (struct sockaddr *) &local, sizeof(local)) != 0) {
         printf("bind failed\n");
     }
+    // Print the name
+    struct sockaddr_in sktName;
+    int nameLen = sizeof(sktName);
+    if (getsockname(s, (struct sockaddr *) &sktName, &nameLen) == SOCKET_ERROR) {
+        printf("getsockname failed\n");
+        return 1;
+    }
+    printf("Socket address: %u.%u.%u.%u:%u\n", sktName.sin_addr.S_un.S_un_b.s_b1, sktName.sin_addr.S_un.S_un_b.s_b2,
+           sktName.sin_addr.S_un.S_un_b.s_b3, sktName.sin_addr.S_un.S_un_b.s_b4, sktName.sin_port);
 
     char serialBuf[1024];
     char ipBuf[1024];
