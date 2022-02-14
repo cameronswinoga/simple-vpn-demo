@@ -95,7 +95,7 @@ static int write_port(HANDLE port, uint8_t *buffer, size_t size)
     return bytesWritten;
 }
 
-static SSIZE_T read_port(HANDLE port, char *buffer, size_t size)
+static SSIZE_T read_port(HANDLE port, uint8_t *buffer, size_t size)
 {
     DWORD bytesRead;
     if (!ReadFile(port, buffer, size, &bytesRead, NULL)) {
@@ -105,7 +105,7 @@ static SSIZE_T read_port(HANDLE port, char *buffer, size_t size)
     return bytesRead;
 }
 
-static void hex(char *source, char *dest, ssize_t count)
+static void hex(uint8_t *source, char *dest, ssize_t count)
 {
     memset(dest, 0, count);
     for (ssize_t i = 0; i < count; ++i) {
@@ -113,7 +113,7 @@ static void hex(char *source, char *dest, ssize_t count)
     }
 }
 
-static bool parsePorts(int protocol, int count, const char *buffer, uint16_t *srcPort, uint16_t *dstPort)
+static bool parsePorts(int protocol, int count, const uint8_t *buffer, uint16_t *srcPort, uint16_t *dstPort)
 {
     if (!ARG_IN_LIST(protocol, IPPROTO_UDP, IPPROTO_TCP) || count < 4) {
         printf("Can't dump ports: %i %i\n", protocol, count);
@@ -126,11 +126,11 @@ static bool parsePorts(int protocol, int count, const char *buffer, uint16_t *sr
     return true;
 }
 
-static uint16_t ip_checksum(void *vdata, size_t length)
+static uint16_t ip_checksum(uint8_t *vdata, size_t length)
 {
 
-    char *data   = (char *) vdata;  // Cast the data pointer to one that can be indexed
-    uint32_t acc = 0xffff;          // Initialise the accumulator
+    uint8_t *data = vdata;   // Cast the data pointer to one that can be indexed
+    uint32_t acc  = 0xffff;  // Initialise the accumulator
 
     // Handle complete 16-bit blocks.
     for (size_t i = 0; i + 1 < length; i += 2) {
@@ -195,21 +195,25 @@ static uint16_t modifyIpv4Pkt(uint8_t *buf, unsigned length)
     const uint16_t ipv4HdrLen    = (buf[0] & 0x0f) * 4;
     const uint16_t ipDatagramLen = (buf[2] << 8) | (buf[3] << 0);
     printf("IPv4 hdr len: %u, datagram len: %u\n", ipv4HdrLen, ipDatagramLen);
-    
+    if (length < ipDatagramLen) {
+        printf("Buffer length %u less than IPv4 datagram length\n", length);
+        return 0;
+    }
+
     // Modify the source address
     buf[12] = 10;
     buf[13] = 56;
     buf[14] = 116;
     buf[15] = 104;
 
-    char ipChkSumBuf[20];
+    uint8_t ipChkSumBuf[20];
     memcpy(ipChkSumBuf, buf, sizeof(ipChkSumBuf));
     // Zero out old checksum
     ipChkSumBuf[10]         = 0;
     ipChkSumBuf[11]         = 0;
     const uint16_t ipChkSum = ip_checksum(ipChkSumBuf, ARRAY_SIZE(ipChkSumBuf));
-    buf[10]              = (char) (ipChkSum >> 0);
-    buf[11]              = (char) (ipChkSum >> 8);
+    buf[10]                 = (char) (ipChkSum >> 0);
+    buf[11]                 = (char) (ipChkSum >> 8);
 
     //    // Modify source port? FIXME: Why is this needed??
     //    buf[20 + 1] = (char) (58356 >> 0);
@@ -220,16 +224,16 @@ static uint16_t modifyIpv4Pkt(uint8_t *buf, unsigned length)
     const uint8_t *addrsPtr   = buf + 12;
     const uint8_t *udpDataPtr = buf + ipv4HdrLen;
     // Zero out old checksum
-    buf[ipv4HdrLen + 6]   = 0;
-    buf[ipv4HdrLen + 7]   = 0;
+    buf[ipv4HdrLen + 6]      = 0;
+    buf[ipv4HdrLen + 7]      = 0;
     const uint16_t udpChkSum = htons(checksum_tcpudp(udp_length, proto, addrsPtr, udpDataPtr));
-    buf[ipv4HdrLen + 6]   = (char) (udpChkSum >> 0);
-    buf[ipv4HdrLen + 7]   = (char) (udpChkSum >> 8);
+    buf[ipv4HdrLen + 6]      = (char) (udpChkSum >> 0);
+    buf[ipv4HdrLen + 7]      = (char) (udpChkSum >> 8);
 
     return ipDatagramLen;
 }
 
-static bool parseIpv4Pkt(int count, char *buffer, uint32_t *dstIpPtr, uint16_t *dstPortPtr)
+static bool parseIpv4Pkt(int count, uint8_t *buffer, uint32_t *dstIpPtr, uint16_t *dstPortPtr)
 {
     if (count < 20) {
         printf("IPv4 packet too short\n");
@@ -265,7 +269,7 @@ static bool parseIpv4Pkt(int count, char *buffer, uint32_t *dstIpPtr, uint16_t *
     return true;
 }
 
-static bool parseIpv6Pkt(int count, char *buffer)
+static bool parseIpv6Pkt(int count, uint8_t *buffer)
 {
     if (count < 40) {
         printf("IPv6 packet too short\n");
@@ -294,7 +298,7 @@ static bool parseIpv6Pkt(int count, char *buffer)
     return true;
 }
 
-static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
+static bool serToSkt(uint8_t *serBuf, int serBufSize, SOCKET sktFd, uint8_t *sktBuf)
 {
     const SSIZE_T serBytesRead = read_port(hComm, serBuf, serBufSize);
     if (serBytesRead < 0) {
@@ -341,8 +345,8 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
         .sin_addr.s_addr = dstIp,
         .sin_port        = htons(dstPort),
     };
-    printf("Sending %lli bytes\n", pktLen);
-    const int sktBytesSent = sendto(sktFd, sktBuf, pktLen, 0, (struct sockaddr *) &dest, sizeof(dest));
+    printf("Sending %u bytes\n", pktLen);
+    const int sktBytesSent = sendto(sktFd, (const char *) sktBuf, pktLen, 0, (struct sockaddr *) &dest, sizeof(dest));
     if (sktBytesSent == SOCKET_ERROR) {
         wchar_t *sBuf = NULL;
         FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
@@ -359,7 +363,7 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
     return true;
 }
 
-// static bool sktToSer(int sktFd, char *sktBuf, char *serBuf)
+// static bool sktToSer(int sktFd, uint8_t *sktBuf, uint8_t *serBuf)
 //{
 //     ssize_t sktBytesRead = read(sktFd, sktBuf, 256);
 //     if (sktBytesRead < 0) {
@@ -432,8 +436,8 @@ int main(int argc, char **argv)
     printf("Socket address: %u.%u.%u.%u:%u\n", sktName.sin_addr.S_un.S_un_b.s_b1, sktName.sin_addr.S_un.S_un_b.s_b2,
            sktName.sin_addr.S_un.S_un_b.s_b3, sktName.sin_addr.S_un.S_un_b.s_b4, sktName.sin_port);
 
-    char serialBuf[1024];
-    char ipBuf[1024];
+    uint8_t serialBuf[1024];
+    uint8_t ipBuf[1024];
 
     while (!done) {
         if (!serToSkt(serialBuf, sizeof(serialBuf), s, ipBuf)) {
