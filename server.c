@@ -190,6 +190,45 @@ static uint16_t checksum_tcpudp(uint16_t length, uint16_t proto, const uint8_t *
     return net_checksum_finish(sum);
 }
 
+static uint16_t modifyIpv4Pkt(uint8_t *buf, unsigned length)
+{
+    const uint16_t ipv4HdrLen    = (buf[0] & 0x0f) * 4;
+    const uint16_t ipDatagramLen = (buf[2] << 8) | (buf[3] << 0);
+    printf("IPv4 hdr len: %u, datagram len: %u\n", ipv4HdrLen, ipDatagramLen);
+    
+    // Modify the source address
+    buf[12] = 10;
+    buf[13] = 56;
+    buf[14] = 116;
+    buf[15] = 104;
+
+    char ipChkSumBuf[20];
+    memcpy(ipChkSumBuf, buf, sizeof(ipChkSumBuf));
+    // Zero out old checksum
+    ipChkSumBuf[10]         = 0;
+    ipChkSumBuf[11]         = 0;
+    const uint16_t ipChkSum = ip_checksum(ipChkSumBuf, ARRAY_SIZE(ipChkSumBuf));
+    buf[10]              = (char) (ipChkSum >> 0);
+    buf[11]              = (char) (ipChkSum >> 8);
+
+    //    // Modify source port? FIXME: Why is this needed??
+    //    buf[20 + 1] = (char) (58356 >> 0);
+    //    buf[20 + 0] = (char) (58356 >> 8);
+
+    const unsigned udp_length = ipDatagramLen - ipv4HdrLen;
+    const unsigned proto      = buf[9];
+    const uint8_t *addrsPtr   = buf + 12;
+    const uint8_t *udpDataPtr = buf + ipv4HdrLen;
+    // Zero out old checksum
+    buf[ipv4HdrLen + 6]   = 0;
+    buf[ipv4HdrLen + 7]   = 0;
+    const uint16_t udpChkSum = htons(checksum_tcpudp(udp_length, proto, addrsPtr, udpDataPtr));
+    buf[ipv4HdrLen + 6]   = (char) (udpChkSum >> 0);
+    buf[ipv4HdrLen + 7]   = (char) (udpChkSum >> 8);
+
+    return ipDatagramLen;
+}
+
 static bool parseIpv4Pkt(int count, char *buffer, uint32_t *dstIpPtr, uint16_t *dstPortPtr)
 {
     if (count < 20) {
@@ -265,37 +304,6 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
     else if (serBytesRead == 0) {
         return true;  // No data
     }
-    const unsigned ipv4HdrLen = 20;
-
-    // Modify the source address
-    serBuf[12] = 10;
-    serBuf[13] = 56;
-    serBuf[14] = 116;
-    serBuf[15] = 104;
-
-    char ipChkSumBuf[20];
-    memcpy(ipChkSumBuf, serBuf, sizeof(ipChkSumBuf));
-    // Zero out old checksum
-    ipChkSumBuf[10]         = 0;
-    ipChkSumBuf[11]         = 0;
-    const uint16_t ipChkSum = ip_checksum(ipChkSumBuf, ARRAY_SIZE(ipChkSumBuf));
-    serBuf[10]            = (char) (ipChkSum >> 0);
-    serBuf[11]            = (char) (ipChkSum >> 8);
-
-//    // Modify source port? FIXME: Why is this needed??
-//    serBuf[20 + 1] = (char) (58356 >> 0);
-//    serBuf[20 + 0] = (char) (58356 >> 8);
-
-    const unsigned udp_length = serBytesRead - ipv4HdrLen;
-    const unsigned proto      = serBuf[9];
-    const uint8_t *addrsPtr   = (uint8_t *) serBuf + 12;
-    const uint8_t *udpDataPtr = (uint8_t *) serBuf + ipv4HdrLen;
-    // Zero out old checksum
-    serBuf[ipv4HdrLen + 6]   = 0;
-    serBuf[ipv4HdrLen + 7]   = 0;
-    const uint16_t udpChkSum = htons(checksum_tcpudp(udp_length, proto, addrsPtr, udpDataPtr));
-    serBuf[ipv4HdrLen + 6]   = (char) (udpChkSum >> 0);
-    serBuf[ipv4HdrLen + 7]   = (char) (udpChkSum >> 8);
 
     // Copy the buffer from serial to socket
     memcpy(sktBuf, serBuf, serBytesRead);
@@ -306,16 +314,21 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
     printf("\n");
     fflush(stdout);
 
-    unsigned char version = ((unsigned char) serBuf[0]) >> 4;
+    unsigned char version = ((unsigned char) sktBuf[0]) >> 4;
     uint32_t dstIp;
     uint16_t dstPort;
+    uint16_t pktLen;
     if (version == 4) {
-        if (!parseIpv4Pkt(serBytesRead, serBuf, &dstIp, &dstPort)) {
+        if (!parseIpv4Pkt(serBytesRead, sktBuf, &dstIp, &dstPort)) {
+            return true;
+        }
+        pktLen = modifyIpv4Pkt(sktBuf, serBytesRead);
+        if (!parseIpv4Pkt(serBytesRead, sktBuf, &dstIp, &dstPort)) {
             return true;
         }
     }
     else if (version == 6) {
-        //        parseIpv6Pkt(serBytesRead, serBuf);
+        //        parseIpv6Pkt(serBytesRead, sktBuf);
         return true;  // IPv6 not handled yet
     }
     else {
@@ -328,8 +341,8 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
         .sin_addr.s_addr = dstIp,
         .sin_port        = htons(dstPort),
     };
-    printf("Sending %lli bytes\n", serBytesRead);
-    const int sktBytesSent = sendto(sktFd, sktBuf, serBytesRead, 0, (struct sockaddr *) &dest, sizeof(dest));
+    printf("Sending %lli bytes\n", pktLen);
+    const int sktBytesSent = sendto(sktFd, sktBuf, pktLen, 0, (struct sockaddr *) &dest, sizeof(dest));
     if (sktBytesSent == SOCKET_ERROR) {
         wchar_t *sBuf = NULL;
         FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
@@ -338,6 +351,10 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
         return false;
     }
     printf("Sent %i\n", sktBytesSent);
+    if (sktBytesSent != pktLen) {
+        printf("Couldn't send all bytes!");
+        return false;
+    }
 
     return true;
 }
