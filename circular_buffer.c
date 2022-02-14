@@ -139,8 +139,7 @@ int circular_buf_get(cbuf_handle_t me, uint8_t *data)
 int circular_buf_get_all(cbuf_handle_t me, uint8_t *data, size_t len)
 {
     assert(me && data && me->buffer);
-    const unsigned spacesLeft = me->max - circular_buf_size(me);
-    assert(len <= spacesLeft);
+    assert(len <= circular_buf_size(me));
 
     for (unsigned i = 0; i < len; i++) {
         if (circular_buf_empty(me)) {

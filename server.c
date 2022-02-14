@@ -492,7 +492,7 @@ int main(int argc, char **argv)
     printf("Socket address: %u.%u.%u.%u:%u\n", sktName.sin_addr.S_un.S_un_b.s_b1, sktName.sin_addr.S_un.S_un_b.s_b2,
            sktName.sin_addr.S_un.S_un_b.s_b3, sktName.sin_addr.S_un.S_un_b.s_b4, sktName.sin_port);
 
-    uint8_t serialBuf[1024];
+    uint8_t serialBuf[4096];
     uint8_t ipBuf[1024];
 
     cbuf_handle_t serialCBuf = circular_buf_init(serialBuf, sizeof serialBuf);

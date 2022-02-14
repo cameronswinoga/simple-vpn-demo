@@ -136,6 +136,11 @@ static bool tunToSkt(fd_set readSet, int tunFd, char *tunBuf, int sktFd, char *s
         perror("read from tunFd error");
         return false;
     }
+    const uint8_t ipVersion = tunBuf[0] >> 4;
+    if (ipVersion != 4) {
+        printf("Ignoring IPv%u packet\n", ipVersion);
+        return true;
+    }
 
     memcpy(sktBuf, tunBuf, tunBytesRead);
     printf("%zu>", tunBytesRead);
