@@ -156,6 +156,40 @@ static uint16_t ip_checksum(void *vdata, size_t length)
     return htons(~acc);
 }
 
+static uint32_t net_checksum_add(int len, const uint8_t *buf)
+{
+    uint32_t sum = 0;
+
+    for (int i = 0; i < len; i++) {
+        if (i & 0x1) {
+            sum += (uint32_t) buf[i];
+        }
+        else {
+            sum += (uint32_t) buf[i] << 8;
+        }
+    }
+    return sum;
+}
+
+static uint16_t net_checksum_finish(uint32_t sum)
+{
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    // take one's complement
+    return (uint16_t) ~sum;
+}
+
+static uint16_t checksum_tcpudp(uint16_t length, uint16_t proto, const uint8_t *addrs, const uint8_t *buf)
+{
+    uint32_t sum = 0;
+
+    sum += net_checksum_add(length, buf);  // payload
+    sum += net_checksum_add(8, addrs);     // src + dst address
+    sum += proto + length;                 // protocol & length
+    return net_checksum_finish(sum);
+}
+
 static bool parseIpv4Pkt(int count, char *buffer, uint32_t *dstIpPtr, uint16_t *dstPortPtr)
 {
     if (count < 20) {
@@ -231,31 +265,37 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
     else if (serBytesRead == 0) {
         return true;  // No data
     }
+    const unsigned ipv4HdrLen = 20;
 
-    // Disable flags?
-    serBuf[6] = serBuf[6] & 0b00011111;
-
-    // Modify the source address? Yes, need to
+    // Modify the source address
     serBuf[12] = 10;
     serBuf[13] = 56;
-    serBuf[14] = 99;
-    serBuf[15] = 4;
+    serBuf[14] = 116;
+    serBuf[15] = 104;
 
-    char chkSumBuf[20];
-    memcpy(chkSumBuf, serBuf, sizeof(chkSumBuf));
-    chkSumBuf[10]         = 0;
-    chkSumBuf[11]         = 0;
-    const uint16_t chkSum = ip_checksum(chkSumBuf, 20);
-    serBuf[10]            = (char) (chkSum >> 0);
-    serBuf[11]            = (char) (chkSum >> 8);
+    char ipChkSumBuf[20];
+    memcpy(ipChkSumBuf, serBuf, sizeof(ipChkSumBuf));
+    // Zero out old checksum
+    ipChkSumBuf[10]         = 0;
+    ipChkSumBuf[11]         = 0;
+    const uint16_t ipChkSum = ip_checksum(ipChkSumBuf, ARRAY_SIZE(ipChkSumBuf));
+    serBuf[10]            = (char) (ipChkSum >> 0);
+    serBuf[11]            = (char) (ipChkSum >> 8);
 
+//    // Modify source port? FIXME: Why is this needed??
+//    serBuf[20 + 1] = (char) (58356 >> 0);
+//    serBuf[20 + 0] = (char) (58356 >> 8);
 
-    // Modify source port?
-    serBuf[20 + 1] = (char) (49902 >> 0);
-    serBuf[20 + 0] = (char) (49902 >> 8);
-    // TODO: Add dynamic UDP checksum
-    serBuf[20 + 6] = (char) 0x5d; // Checksum for 'y\n'
-    serBuf[20 + 7] = (char) 0xfa;
+    const unsigned udp_length = serBytesRead - ipv4HdrLen;
+    const unsigned proto      = serBuf[9];
+    const uint8_t *addrsPtr   = (uint8_t *) serBuf + 12;
+    const uint8_t *udpDataPtr = (uint8_t *) serBuf + ipv4HdrLen;
+    // Zero out old checksum
+    serBuf[ipv4HdrLen + 6]   = 0;
+    serBuf[ipv4HdrLen + 7]   = 0;
+    const uint16_t udpChkSum = htons(checksum_tcpudp(udp_length, proto, addrsPtr, udpDataPtr));
+    serBuf[ipv4HdrLen + 6]   = (char) (udpChkSum >> 0);
+    serBuf[ipv4HdrLen + 7]   = (char) (udpChkSum >> 8);
 
     // Copy the buffer from serial to socket
     memcpy(sktBuf, serBuf, serBytesRead);

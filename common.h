@@ -1,6 +1,8 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+
 #define REPEATED_OPERATOR_COMPARISON(Op1, Op2, M, ...)                                                                             \
     (REPEATED_OPERATOR_COMPARISON__(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1)(Op1, Op2, (M), __VA_ARGS__))
 #define REPEATED_OPERATOR_COMPARISON__(_1, _2, _3, _4, _5, _6, _7, _8, X, ...) REPEATED_OPERATOR_COMPARISON_##X
