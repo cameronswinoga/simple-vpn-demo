@@ -32,6 +32,8 @@ void circular_buf_reset(cbuf_handle_t me);
 /// Requires: me is valid and created by circular_buf_init
 void circular_buf_put(cbuf_handle_t me, uint8_t data);
 
+void circular_buf_put_all(cbuf_handle_t me, uint8_t *data, size_t len);
+
 /// Put that rejects new data if the buffer is full
 /// Note: if you are using the threadsafe version, *this* is the put you should use
 /// Requires: me is valid and created by circular_buf_init
@@ -42,6 +44,8 @@ int circular_buf_try_put(cbuf_handle_t me, uint8_t data);
 /// Requires: me is valid and created by circular_buf_init
 /// Returns 0 on success, -1 if the buffer is empty
 int circular_buf_get(cbuf_handle_t me, uint8_t *data);
+
+int circular_buf_get_all(cbuf_handle_t me, uint8_t *data, size_t len);
 
 /// CHecks if the buffer is empty
 /// Requires: me is valid and created by circular_buf_init

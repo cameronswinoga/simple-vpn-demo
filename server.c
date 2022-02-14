@@ -3,12 +3,14 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <assert.h>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 
 #include "common.h"
+#include "circular_buffer.h"
 
 #define SERIAL_PATH "\\\\.\\COM3"
 HANDLE hComm;
@@ -95,13 +97,23 @@ static int write_port(HANDLE port, uint8_t *buffer, size_t size)
     return bytesWritten;
 }
 
-static SSIZE_T read_port(HANDLE port, uint8_t *buffer, size_t size)
+static SSIZE_T read_port(HANDLE port, cbuf_handle_t circularBuf)
 {
     DWORD bytesRead;
-    if (!ReadFile(port, buffer, size, &bytesRead, NULL)) {
+    uint8_t buffer[512];
+    if (!ReadFile(port, buffer, sizeof buffer, &bytesRead, NULL)) {
         printf("Failed to read from port\n");
         return -1;
     }
+    if (bytesRead != 0) {
+        printf("SERIAL>%li:", bytesRead);
+        for (unsigned i = 0; i < bytesRead; i++) {
+            printf("%02hhx", buffer[i]);
+        }
+        printf("\n");
+        fflush(stdout);
+    }
+    circular_buf_put_all(circularBuf, buffer, bytesRead);
     return bytesRead;
 }
 
@@ -298,9 +310,9 @@ static bool parseIpv6Pkt(int count, uint8_t *buffer)
     return true;
 }
 
-static bool serToSkt(uint8_t *serBuf, int serBufSize, SOCKET sktFd, uint8_t *sktBuf)
+static bool readSerial(cbuf_handle_t serCBuf)
 {
-    const SSIZE_T serBytesRead = read_port(hComm, serBuf, serBufSize);
+    const SSIZE_T serBytesRead = read_port(hComm, serCBuf);
     if (serBytesRead < 0) {
         printf("Read error: %zi\n", serBytesRead);
         return false;
@@ -308,56 +320,100 @@ static bool serToSkt(uint8_t *serBuf, int serBufSize, SOCKET sktFd, uint8_t *skt
     else if (serBytesRead == 0) {
         return true;  // No data
     }
+    return true;
+}
 
-    // Copy the buffer from serial to socket
-    memcpy(sktBuf, serBuf, serBytesRead);
-    printf(">%zi:", serBytesRead);
-    for (int i = 0; i < serBytesRead; i++) {
-        printf("%02hhx", serBuf[i]);
+static bool popIpPkt(cbuf_handle_t inBuf,
+                     uint8_t *outBuf,
+                     size_t outBufLen,
+                     uint8_t *ipVersionPtr,
+                     uint16_t *ipHdrLenPtr,
+                     uint16_t *ipPktLenPtr)
+{
+    uint8_t peekBuf[7];
+    if (circular_buf_peek(inBuf, peekBuf, sizeof peekBuf) != 0) {
+        return false;
     }
-    printf("\n");
-    fflush(stdout);
-
-    unsigned char version = ((unsigned char) sktBuf[0]) >> 4;
-    uint32_t dstIp;
-    uint16_t dstPort;
-    uint16_t pktLen;
-    if (version == 4) {
-        if (!parseIpv4Pkt(serBytesRead, sktBuf, &dstIp, &dstPort)) {
-            return true;
-        }
-        pktLen = modifyIpv4Pkt(sktBuf, serBytesRead);
-        if (!parseIpv4Pkt(serBytesRead, sktBuf, &dstIp, &dstPort)) {
-            return true;
-        }
+    *ipVersionPtr = peekBuf[0] >> 4;
+    if (*ipVersionPtr == 4) {
+        *ipHdrLenPtr = (peekBuf[0] & 0x0f) * 4;
+        *ipPktLenPtr = (peekBuf[2] << 8) | (peekBuf[3] << 0);
     }
-    else if (version == 6) {
-        //        parseIpv6Pkt(serBytesRead, sktBuf);
-        return true;  // IPv6 not handled yet
+    else if (*ipVersionPtr == 6) {
+        *ipHdrLenPtr = 40;  // Fixed length header
+        *ipPktLenPtr = (peekBuf[5] << 8) | (peekBuf[6] << 0);
     }
     else {
-        printf("Unknown packet version\n");
+        printf("Unknown packet version %u\n", *ipVersionPtr);
+        return false;
+    }
+    printf("Grabbed IPv%u: ipHdrLen=%u ipPktLen=%u\n", *ipVersionPtr, *ipHdrLenPtr, *ipPktLenPtr);
+
+    if (circular_buf_size(inBuf) < *ipPktLenPtr) {
+        printf("buffer size %llu < datagram size %u\n", circular_buf_size(inBuf), *ipPktLenPtr);
+        return false;
+    }
+    if (outBufLen < *ipPktLenPtr) {
+        printf("outBuf not big enough for ipPkt: %zu %u\n", outBufLen, *ipPktLenPtr);
+        return false;
+    }
+    if (circular_buf_get_all(inBuf, outBuf, *ipPktLenPtr) != 0) {
+        printf("Couldn't pop all bytes\n");
+        return false;
+    }
+    return true;
+}
+
+static bool serToSkt(cbuf_handle_t serCBuf, SOCKET sktFd)
+{
+    if (!readSerial(serCBuf)) {
+        return false;
     }
 
-    // send the pkt
-    struct sockaddr_in dest = {
-        .sin_family      = AF_INET,
-        .sin_addr.s_addr = dstIp,
-        .sin_port        = htons(dstPort),
-    };
-    printf("Sending %u bytes\n", pktLen);
-    const int sktBytesSent = sendto(sktFd, (const char *) sktBuf, pktLen, 0, (struct sockaddr *) &dest, sizeof(dest));
-    if (sktBytesSent == SOCKET_ERROR) {
-        wchar_t *sBuf = NULL;
-        FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
-                       WSAGetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPWSTR) &sBuf, 0, NULL);
-        printf("send failed %i: %S\n", WSAGetLastError(), sBuf);
-        return false;
-    }
-    printf("Sent %i\n", sktBytesSent);
-    if (sktBytesSent != pktLen) {
-        printf("Couldn't send all bytes!");
-        return false;
+    uint8_t sktBuf[1024];
+    while (true) {
+        uint8_t ipVersion;
+        uint16_t ipHdrLen;
+        uint16_t ipPktLen;
+        if (!popIpPkt(serCBuf, sktBuf, sizeof sktBuf, &ipVersion, &ipHdrLen, &ipPktLen)) {
+            break;
+        }
+        if (ipVersion != 4) {
+            printf("Skipping IPv%u\n", ipVersion);
+            continue;
+        }
+
+        uint32_t dstIp;
+        uint16_t dstPort;
+        uint16_t pktLen;
+        if (!parseIpv4Pkt(ipPktLen, sktBuf, &dstIp, &dstPort)) {
+            return true;
+        }
+        pktLen = modifyIpv4Pkt(sktBuf, ipPktLen);
+        if (!parseIpv4Pkt(ipPktLen, sktBuf, &dstIp, &dstPort)) {
+            return true;
+        }
+
+        // send the pkt
+        struct sockaddr_in dest = {
+            .sin_family      = AF_INET,
+            .sin_addr.s_addr = dstIp,
+            .sin_port        = htons(dstPort),
+        };
+        printf("Sending %u bytes\n", pktLen);
+        const int sktBytesSent = sendto(sktFd, (const char *) sktBuf, pktLen, 0, (struct sockaddr *) &dest, sizeof(dest));
+        if (sktBytesSent == SOCKET_ERROR) {
+            wchar_t *sBuf = NULL;
+            FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+                           WSAGetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPWSTR) &sBuf, 0, NULL);
+            printf("send failed %i: %S\n", WSAGetLastError(), sBuf);
+            return false;
+        }
+        printf("Sent %i\n", sktBytesSent);
+        if (sktBytesSent != pktLen) {
+            printf("Couldn't send all bytes!");
+            return false;
+        }
     }
 
     return true;
@@ -439,8 +495,11 @@ int main(int argc, char **argv)
     uint8_t serialBuf[1024];
     uint8_t ipBuf[1024];
 
+    cbuf_handle_t serialCBuf = circular_buf_init(serialBuf, sizeof serialBuf);
+    cbuf_handle_t ipCBuf     = circular_buf_init(ipBuf, sizeof ipBuf);
+
     while (!done) {
-        if (!serToSkt(serialBuf, sizeof(serialBuf), s, ipBuf)) {
+        if (!serToSkt(serialCBuf, s)) {
             printf("serToSkt error\n");
             break;
         }

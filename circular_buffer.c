@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <assert.h>
+#include <stdio.h>
 
 #include "circular_buffer.h"
 
@@ -31,7 +32,7 @@ static void advance_head_pointer(cbuf_handle_t me)
     me->full = (me->head == me->tail);
 }
 
-cbuf_handle_t circular_buf_init(uint8_t *buffer , size_t size)
+cbuf_handle_t circular_buf_init(uint8_t *buffer, size_t size)
 {
     assert(buffer && size);
 
@@ -83,7 +84,6 @@ size_t circular_buf_size(cbuf_handle_t me)
 size_t circular_buf_capacity(cbuf_handle_t me)
 {
     assert(me);
-
     return me->max;
 }
 
@@ -92,8 +92,17 @@ void circular_buf_put(cbuf_handle_t me, uint8_t data)
     assert(me && me->buffer);
 
     me->buffer[me->head] = data;
-
     advance_head_pointer(me);
+}
+
+void circular_buf_put_all(cbuf_handle_t me, uint8_t *data, size_t len)
+{
+    assert(me && me->buffer && data);
+
+    for (unsigned i = 0; i < len; i++) {
+        me->buffer[me->head] = data[i];
+        advance_head_pointer(me);
+    }
 }
 
 int circular_buf_try_put(cbuf_handle_t me, uint8_t data)
@@ -125,6 +134,24 @@ int circular_buf_get(cbuf_handle_t me, uint8_t *data)
     }
 
     return r;
+}
+
+int circular_buf_get_all(cbuf_handle_t me, uint8_t *data, size_t len)
+{
+    assert(me && data && me->buffer);
+    const unsigned spacesLeft = me->max - circular_buf_size(me);
+    assert(len <= spacesLeft);
+
+    for (unsigned i = 0; i < len; i++) {
+        if (circular_buf_empty(me)) {
+            return -1;
+        }
+        data[i]  = me->buffer[me->tail];
+        me->tail = advance_headtail_value(me->tail, me->max);
+        me->full = false;
+    }
+
+    return 0;
 }
 
 bool circular_buf_empty(cbuf_handle_t me)
