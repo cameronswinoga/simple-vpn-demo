@@ -1,0 +1,399 @@
+diff --git a/Makefile b/Makefile
+index 2063c336b28..44d9acd9156 100644
+--- a/Makefile
++++ b/Makefile
+@@ -4,6 +4,8 @@ client : client.c
+ 	gcc -o $@ $^ -g $(CFLAGS)
+ server : server.c
+ 	x86_64-w64-mingw32-gcc -o $@ $^ -g $(CFLAGS) -D__USE_MINGW_ANSI_STDIO=1 -lws2_32
++rawudp : rawudp.c
++	x86_64-w64-mingw32-gcc -o $@ $^ -g $(CFLAGS) -D__USE_MINGW_ANSI_STDIO=1 -lws2_32
+ 
+ clean :
+ 	rm -f client server
+diff --git a/client.c b/client.c
+index cfb849b1c83..7349b3daba2 100644
+--- a/client.c
++++ b/client.c
+@@ -22,7 +22,7 @@
+ 
+ #define MTU 1400
+ 
+-#define SOCKET_PATH       "/tmp/vm_port3"
++#define SOCKET_PATH       "/tmp/vm_port4"
+ #define TUN_INTERFACE     "tun_client"
+ #define INTERFACE_ADDRESS "10.8.0.2/16"
+ 
+@@ -79,7 +79,7 @@ static void setup_route_table(void)
+ {
+     printf("Adding routing tables\n");
+ 
+-    run("ip route add 15.8.0.0/24 dev %s proto static", TUN_INTERFACE);
++    run("ip route add 142.65.58.38/32 dev %s proto static", TUN_INTERFACE);
+     run("echo 0 > /proc/sys/net/ipv4/conf/%s/rp_filter", TUN_INTERFACE);
+     run("echo 1 > /proc/sys/net/ipv4/conf/%s/accept_local", TUN_INTERFACE);
+ }
+@@ -165,7 +165,7 @@ static bool sktToTun(int sktFd, char *sktBuf, int tunFd, char *tunBuf)
+         return 1;
+     }
+ 
+-    memcpy(tunBuf, sktBuf, sktBytesRead);
++    memcpy(tunBuf, "Hellloooooooooooooooooo\r\n", sktBytesRead);
+     printf("%zu<", sktBytesRead);
+     fflush(stdout);
+ 
+diff --git a/server.c b/server.c
+index fa4603da838..a55c8219dd5 100644
+--- a/server.c
++++ b/server.c
+@@ -8,9 +8,16 @@
+ 
+ #include "common.h"
+ 
+-#define SERIAL_PATH "\\\\.\\COM3"
++#define SERIAL_PATH "\\\\.\\COM4"
++#define MAX_TCP_CONNECTIONS 10
++
+ HANDLE hComm;
+-volatile bool done = false;
++volatile bool done                 = false;
++static const unsigned IPV4_HDR_LEN = 20;
++static const unsigned IPV6_HDR_LEN = 40;
++static SOCKET udpSkt = NULL;
++static int numTcpSkts = 0;
++static SOCKET tcpSkts[MAX_TCP_CONNECTIONS];
+ 
+ static BOOL WINAPI cleanup(DWORD signo)
+ {
+@@ -79,7 +86,7 @@ static bool openSerialPort(char *portPath, HANDLE *serialHandle)
+     return true;
+ }
+ 
+-static int write_port(HANDLE port, uint8_t *buffer, size_t size)
++static int write_port(HANDLE port, char *buffer, size_t size)
+ {
+     DWORD bytesWritten;
+     if (!WriteFile(port, buffer, size, &bytesWritten, NULL)) {
+@@ -124,10 +131,18 @@ static bool parsePorts(int protocol, int count, const char *buffer, uint16_t *sr
+     return true;
+ }
+ 
+-static bool parseIpv4Pkt(int count, char *buffer, uint32_t *dstIpPtr, uint16_t *dstPortPtr)
++static bool sendIpv4Pkt(unsigned bufSize, char *buffer, char *sktBuf)
+ {
+-    if (count < 20) {
+-        printf("IPv4 packet too short\n");
++    if (bufSize < IPV4_HDR_LEN) {
++        printf("IPv4::packet too short\n");
++        return false;
++    }
++
++    const unsigned ttl = (unsigned char) buffer[8];
++    const int protocol = (unsigned char) buffer[9];
++
++    if (!ARG_IN_LIST(protocol, IPPROTO_UDP, IPPROTO_TCP)) {
++        printf("IPv4::Unsupported protocol: %i\n", protocol);
+         return false;
+     }
+ 
+@@ -138,58 +153,96 @@ static bool parseIpv4Pkt(int count, char *buffer, uint32_t *dstIpPtr, uint16_t *
+         } u;
+     } Ipv4Addr;
+ 
+-    const unsigned ttl = (unsigned char) buffer[8];
+-    const int protocol = (unsigned char) buffer[9];
+     Ipv4Addr srcIp;
+     memcpy(&srcIp, buffer + 12, sizeof srcIp);
+     Ipv4Addr dstIp;
+     memcpy(&dstIp, buffer + 16, sizeof dstIp);
+-    *dstIpPtr = dstIp.u.lon;
+ 
+-    uint16_t srcPort      = 0;
+-    const bool validPorts = parsePorts(protocol, count - 20, buffer + 20, &srcPort, dstPortPtr);
+-
+-    struct protoent *protocol_entry = getprotobynumber(protocol);
+-    printf("IPv4: src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u proto=%u(%s) ttl=%u\n", srcIp.u.arr[0], srcIp.u.arr[1], srcIp.u.arr[2],
+-           srcIp.u.arr[3], srcPort, dstIp.u.arr[0], dstIp.u.arr[1], dstIp.u.arr[2], dstIp.u.arr[3], *dstPortPtr,
+-           (unsigned) protocol, protocol_entry == NULL ? "?" : protocol_entry->p_name, ttl);
+-
+-    if (!validPorts) {
++    if (bufSize < 24) {
++        printf("IPv4::Packet not long enough for port parsing: %i\n", bufSize);
+         return false;
+     }
++    uint16_t srcPort;
++    uint16_t dstPort;
++    memcpy(&srcPort, buffer + IPV4_HDR_LEN, sizeof srcPort);
++    srcPort = htons(srcPort);
++    memcpy(&dstPort, buffer + IPV4_HDR_LEN + 2, sizeof dstPort);
++    dstPort = htons(dstPort);
++
++    struct protoent *protocol_entry = getprotobynumber(protocol);
++    printf("IPv4::src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u proto=%u(%s) ttl=%u\n", srcIp.u.arr[0], srcIp.u.arr[1], srcIp.u.arr[2],
++           srcIp.u.arr[3], srcPort, dstIp.u.arr[0], dstIp.u.arr[1], dstIp.u.arr[2], dstIp.u.arr[3], dstPort, (unsigned) protocol,
++           protocol_entry == NULL ? "?" : protocol_entry->p_name, ttl);
++
++    const int sktDataLen = bufSize - IPV4_HDR_LEN;
++    // Strip IPv4 header
++    memcpy(sktBuf, buffer + IPV4_HDR_LEN, sktDataLen);
++
++    if (protocol == IPPROTO_UDP) {
++        // send the pkt
++        struct sockaddr_in dest = {
++            .sin_family      = AF_INET,
++            .sin_addr.s_addr = dstIp.u.lon,
++            .sin_port        = htons(dstPort),
++        };
++        printf("IPv4::UDP::Sending %i bytes\n", sktDataLen);
++        for (int i = 0; i < sktDataLen; i++) {
++            printf("%02hhx", sktBuf[i]);
++        }
++        printf("\n");
++        fflush(stdout);
++        const int sktBytesSent = sendto(udpSkt, sktBuf, sktDataLen, 0, (struct sockaddr *) &dest, sizeof(dest));
++        if (sktBytesSent == SOCKET_ERROR) {
++            printf("sendto failed\n");
++            return false;
++        }
++        printf("IPv4::UDP::Actually sent %i bytes\n", sktBytesSent);
++    }
++    else if (protocol == IPPROTO_TCP) {
++        printf("IPv4::TCP not supported yet\n");
++    }
++    else {
++        printf("Unknown error: %i\n", protocol);
++    }
++
+     return true;
+ }
+ 
+ static bool parseIpv6Pkt(int count, char *buffer)
+ {
+-    if (count < 40) {
+-        printf("IPv6 packet too short\n");
++    if (count < IPV6_HDR_LEN) {
++        printf("IPv6::packet too short\n");
+         return false;
+     }
+ 
+     const int protocol  = (unsigned char) buffer[6];
+     const int hop_limit = (unsigned char) buffer[7];
+ 
++    if (!ARG_IN_LIST(protocol, IPPROTO_UDP, IPPROTO_TCP)) {
++        printf("IPv6::Unsupported protocol: %i\n", protocol);
++        return false;
++    }
++
+     char source_address[33];
+     hex(buffer + 8 + 0, source_address, 16);
+     char destination_address[33];
+     hex(buffer + 8 + 16, destination_address, 16);
+ 
+-    uint16_t srcPort      = 0;
+-    uint16_t dstPort      = 0;
+-    const bool validPorts = parsePorts(protocol, count - 40, buffer + 40, &srcPort, &dstPort);
++    uint16_t srcPort;
++    uint16_t dstPort;
++    memcpy(&srcPort, buffer + IPV6_HDR_LEN, sizeof srcPort);
++    srcPort = htons(srcPort);
++    memcpy(&dstPort, buffer + IPV6_HDR_LEN + 2, sizeof dstPort);
++    dstPort = htons(dstPort);
+ 
+     struct protoent *protocol_entry = getprotobynumber(protocol);
+-    printf("IPv6: src=%s:%u dst=%s:%u proto=%i(%s) hop_limit=%i\n", source_address, srcPort, destination_address, dstPort, protocol,
++    printf("IPv6::src=%s:%u dst=%s:%u proto=%i(%s) hop_limit=%i\n", source_address, srcPort, destination_address, dstPort, protocol,
+            protocol_entry == NULL ? "?" : protocol_entry->p_name, hop_limit);
+ 
+-    if (!validPorts) {
+-        return false;
+-    }
+     return true;
+ }
+ 
+-static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
++static bool serToSkt(char *serBuf, int serBufSize, char *sktBuf)
+ {
+     const SSIZE_T serBytesRead = read_port(hComm, serBuf, serBufSize);
+     if (serBytesRead < 0) {
+@@ -200,7 +253,6 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
+         return true;  // No data
+     }
+ 
+-    memcpy(sktBuf, serBuf, serBytesRead);
+     printf(">%zi:", serBytesRead);
+     for (int i = 0; i < serBytesRead; i++) {
+         printf("%02hhx", serBuf[i]);
+@@ -209,60 +261,76 @@ static bool serToSkt(char *serBuf, int serBufSize, SOCKET sktFd, char *sktBuf)
+     fflush(stdout);
+ 
+     unsigned char version = ((unsigned char) serBuf[0]) >> 4;
+-    uint32_t dstIp;
+-    uint16_t dstPort;
+     if (version == 4) {
+-        if (!parseIpv4Pkt(serBytesRead, serBuf, &dstIp, &dstPort)) {
+-            return true;
+-        }
++        return sendIpv4Pkt((unsigned) serBytesRead, serBuf, sktBuf);
+     }
+     else if (version == 6) {
+-        parseIpv6Pkt(serBytesRead, serBuf);
+-        return true;  // IPv6 not handled yet
++        // IPv6 not handled yet
++        (void) parseIpv6Pkt(serBytesRead, serBuf);
++        return true;
+     }
+     else {
+         printf("Unknown packet version\n");
++        return false;
++    }
++}
++
++static bool udpSktToSer(char *sktBuf, int sktBufLen, char *serBuf)
++{
++
++    struct timeval read_timeout = {
++        .tv_sec  = 0,
++        .tv_usec = 10,
++    };
++    struct fd_set fdSet = {
++        .fd_array[0] = udpSkt,
++        .fd_count    = 1,
++    };
++    const int numSockets = select(0, &fdSet, NULL, NULL, &read_timeout);
++    if (numSockets == SOCKET_ERROR) {
++        printf("select failed\n");
++        return false;
++    }
++    else if (numSockets == 0) {
++        return true;  // No data
+     }
+ 
+-    // send the pkt
+-    struct sockaddr_in dest = {
+-        .sin_family      = AF_INET,
+-        .sin_addr.s_addr = dstIp,
+-        .sin_port        = htons(dstPort),
+-    };
+-    printf("Sending %lli bytes\n", serBytesRead);
+-    const int sktBytesSent = sendto(sktFd, sktBuf, serBytesRead, 0, (struct sockaddr *) &dest, sizeof(dest));
+-    if (sktBytesSent == SOCKET_ERROR) {
+-        printf("sendto failed\n");
++    struct sockaddr_in addr;
++    int fromlen = sizeof(addr);
++    printf("Start recvfrom\n");
++    const int sktBytesRead = recvfrom(udpSkt, sktBuf, sktBufLen, 0, (struct sockaddr *) &addr, &fromlen);
++    printf("Finish recvfrom\n");
++    if (sktBytesRead == SOCKET_ERROR) {
++        printf("Error reading: %i\n", sktBytesRead);
++        return false;
++    }
++    else if (sktBytesRead == 0) {
++        return true;  // No data
++    }
++
++    printf("recvfrom IP addr %s:%u\n", inet_ntoa(addr.sin_addr), addr.sin_port);
++
++    printf("<%u", sktBytesRead);
++    for (int i = 0; i < sktBytesRead; i++) {
++        printf("%02hhx", sktBuf[i]);
++    }
++    printf("\n");
++    fflush(stdout);
++
++    // TODO: Add in IPv4 header
++    memcpy(serBuf, sktBuf, sktBytesRead);
++
++    const ssize_t serialBytesWritten = write_port(hComm, serBuf, sktBytesRead);
++    if (serialBytesWritten < 0) {
++        // TODO: ignore some errno
++        perror("write tun_fd error");
++        printf("%i\n", sktBytesRead);
+         return false;
+     }
+ 
+     return true;
+ }
+ 
+-// static bool sktToSer(int sktFd, char *sktBuf, char *serBuf)
+-//{
+-//     ssize_t sktBytesRead = read(sktFd, sktBuf, 256);
+-//     if (sktBytesRead < 0) {
+-//         printf("Error reading: %zi\n", sktBytesRead);
+-//         return 1;
+-//     }
+-//
+-//     memcpy(serBuf, sktBuf, sktBytesRead);
+-//     printf("%zu<", sktBytesRead);
+-//     fflush(stdout);
+-//
+-//     const ssize_t serialBytesWritten = write(serialFd, serBuf, sktBytesRead);
+-//     if (serialBytesWritten < 0) {
+-//         // TODO: ignore some errno
+-//         perror("write tun_fd error");
+-//         printf("%i %zi\n", serialFd, sktBytesRead);
+-//         return false;
+-//     }
+-//
+-//     return true;
+-// }
+-
+ int main(int argc, char **argv)
+ {
+     UNUSED(argc, argv);
+@@ -284,34 +352,44 @@ int main(int argc, char **argv)
+         return 1;
+     }
+ 
+-    // Open UDP socket, since we don't have admin privileges
+-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+-    if (s == INVALID_SOCKET) {
+-        printf("Socket invalid\n");
+-    }
+     // bind to the local address
+     struct sockaddr_in local = {
+         .sin_family      = AF_INET,
+         .sin_addr.s_addr = INADDR_ANY,  // Any source IP (Only for IPv4!)
+         .sin_port        = 0,           // Any source port
+     };
+-    if (bind(s, (struct sockaddr *) &local, sizeof(local)) != 0) {
++
++    // Open UDP socket
++    udpSkt = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++    if (udpSkt == INVALID_SOCKET) {
++        printf("UDP Socket invalid\n");
++        return 1;
++    }
++    if (bind(udpSkt, (struct sockaddr *) &local, sizeof(local)) != 0) {
+         printf("bind failed\n");
++        return 1;
+     }
+ 
++    // Open TCP socket
++    //    SOCKET tcpSkt = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++    //    if (udpSkt == INVALID_SOCKET) {
++    //        printf("TCP Socket invalid\n");
++    //        return 1;
++    //    }
++
+     char serialBuf[1024];
+-    char ipBuf[1024];
++    char udpBuf[1024];
+ 
+     while (!done) {
+-        if (!serToSkt(serialBuf, sizeof(serialBuf), s, ipBuf)) {
++        if (!serToSkt(serialBuf, sizeof(serialBuf), udpBuf)) {
+             printf("serToSkt error\n");
+             break;
+         }
+ 
+-        //            if (!sktToSer(ip_fd, ipBuf, serialBuf)) {
+-        //                printf("sktToSer error\n");
+-        //                break;
+-        //            }
++        if (!udpSktToSer(udpBuf, sizeof(udpBuf), serialBuf)) {
++            printf("udpSktToSer error\n");
++            break;
++        }
+     }
+ 
+     CloseHandle(hComm);
