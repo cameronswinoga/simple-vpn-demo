@@ -83,7 +83,7 @@ static bool openSerialPort(char *portPath, HANDLE *serialHandle)
     return true;
 }
 
-static int write_port(HANDLE port, uint8_t *buffer, size_t size)
+static int writeSerial(HANDLE port, uint8_t *buffer, size_t size)
 {
     DWORD bytesWritten;
     if (!WriteFile(port, buffer, size, &bytesWritten, NULL)) {
@@ -97,12 +97,12 @@ static int write_port(HANDLE port, uint8_t *buffer, size_t size)
     return bytesWritten;
 }
 
-static SSIZE_T read_port(HANDLE port, cbuf_handle_t circularBuf)
+static SSIZE_T readSerial(HANDLE port, cbuf_handle_t circularBuf)
 {
     DWORD bytesRead;
     uint8_t buffer[512];
     if (!ReadFile(port, buffer, sizeof buffer, &bytesRead, NULL)) {
-        printf("Failed to read from port\n");
+        printf("Failed to read from serial\n");
         return -1;
     }
     if (bytesRead != 0) {
@@ -112,9 +112,57 @@ static SSIZE_T read_port(HANDLE port, cbuf_handle_t circularBuf)
         }
         printf("\n");
         fflush(stdout);
+        circular_buf_put_all(circularBuf, buffer, bytesRead);
     }
-    circular_buf_put_all(circularBuf, buffer, bytesRead);
     return bytesRead;
+}
+
+static int writeSocket(SOCKET socketFd, const char *pktBuf, uint16_t pktLen, uint32_t dstIp, uint16_t dstPort)
+{
+    struct sockaddr_in dest = {
+        .sin_family      = AF_INET,
+        .sin_addr.s_addr = dstIp,
+        .sin_port        = htons(dstPort),
+    };
+    printf("Sending %u bytes\n", pktLen);
+    const int sktBytesSent = sendto(socketFd, pktBuf, pktLen, 0, (struct sockaddr *) &dest, sizeof(dest));
+    if (sktBytesSent == SOCKET_ERROR) {
+        wchar_t *sBuf = NULL;
+        FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+                       WSAGetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPWSTR) &sBuf, 0, NULL);
+        printf("send failed %i: %S\n", WSAGetLastError(), sBuf);
+        return false;
+    }
+    printf("Sent %i\n", sktBytesSent);
+    return sktBytesSent;
+}
+
+static int readSocket(int socketFd, cbuf_handle_t circularBuf)
+{
+    char buffer[2048];
+    struct sockaddr_in source;
+    socklen_t addr_len     = sizeof source;
+    const int sktBytesRead = recvfrom(socketFd, buffer, sizeof buffer, 0, (struct sockaddr *) &source, &addr_len);
+    if (sktBytesRead == SOCKET_ERROR) {
+        if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            return 0;  // No data
+        }
+        wchar_t *sBuf = NULL;
+        FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+                       WSAGetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPWSTR) &sBuf, 0, NULL);
+        printf("recvfrom failed %i: %S\n", WSAGetLastError(), sBuf);
+        return -1;
+    }
+    if (sktBytesRead > 0) {
+        printf("SOCKET>%i:", sktBytesRead);
+        for (int i = 0; i < sktBytesRead; i++) {
+            printf("%02hhx", buffer[i]);
+        }
+        printf("\n");
+        fflush(stdout);
+        circular_buf_put_all(circularBuf, (uint8_t *) buffer, sktBytesRead);
+    }
+    return sktBytesRead;
 }
 
 static void hex(uint8_t *source, char *dest, ssize_t count)
@@ -310,19 +358,6 @@ static bool parseIpv6Pkt(int count, uint8_t *buffer)
     return true;
 }
 
-static bool readSerial(cbuf_handle_t serCBuf)
-{
-    const SSIZE_T serBytesRead = read_port(hComm, serCBuf);
-    if (serBytesRead < 0) {
-        printf("Read error: %zi\n", serBytesRead);
-        return false;
-    }
-    else if (serBytesRead == 0) {
-        return true;  // No data
-    }
-    return true;
-}
-
 static bool popIpPkt(cbuf_handle_t inBuf,
                      uint8_t *outBuf,
                      size_t outBufLen,
@@ -366,8 +401,13 @@ static bool popIpPkt(cbuf_handle_t inBuf,
 
 static bool serToSkt(cbuf_handle_t serCBuf, SOCKET sktFd)
 {
-    if (!readSerial(serCBuf)) {
+    const SSIZE_T serBytesRead = readSerial(hComm, serCBuf);
+    if (serBytesRead < 0) {
+        printf("Read error: %zi\n", serBytesRead);
         return false;
+    }
+    else if (serBytesRead == 0) {
+        return true;  // No data
     }
 
     uint8_t sktBuf[1024];
@@ -385,32 +425,16 @@ static bool serToSkt(cbuf_handle_t serCBuf, SOCKET sktFd)
 
         uint32_t dstIp;
         uint16_t dstPort;
-        uint16_t pktLen;
         if (!parseIpv4Pkt(ipPktLen, sktBuf, &dstIp, &dstPort)) {
             return true;
         }
-        pktLen = modifyIpv4Pkt(sktBuf, ipPktLen);
+        (void) modifyIpv4Pkt(sktBuf, ipPktLen);  // Ignore modified packet length, should be identical
         if (!parseIpv4Pkt(ipPktLen, sktBuf, &dstIp, &dstPort)) {
             return true;
         }
 
-        // send the pkt
-        struct sockaddr_in dest = {
-            .sin_family      = AF_INET,
-            .sin_addr.s_addr = dstIp,
-            .sin_port        = htons(dstPort),
-        };
-        printf("Sending %u bytes\n", pktLen);
-        const int sktBytesSent = sendto(sktFd, (const char *) sktBuf, pktLen, 0, (struct sockaddr *) &dest, sizeof(dest));
-        if (sktBytesSent == SOCKET_ERROR) {
-            wchar_t *sBuf = NULL;
-            FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
-                           WSAGetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPWSTR) &sBuf, 0, NULL);
-            printf("send failed %i: %S\n", WSAGetLastError(), sBuf);
-            return false;
-        }
-        printf("Sent %i\n", sktBytesSent);
-        if (sktBytesSent != pktLen) {
+        const int sktBytesSent = writeSocket(sktFd, (const char *) sktBuf, ipPktLen, dstIp, dstPort);
+        if (sktBytesSent != ipPktLen) {
             printf("Couldn't send all bytes!");
             return false;
         }
@@ -419,28 +443,45 @@ static bool serToSkt(cbuf_handle_t serCBuf, SOCKET sktFd)
     return true;
 }
 
-// static bool sktToSer(int sktFd, uint8_t *sktBuf, uint8_t *serBuf)
-//{
-//     ssize_t sktBytesRead = read(sktFd, sktBuf, 256);
-//     if (sktBytesRead < 0) {
-//         printf("Error reading: %zi\n", sktBytesRead);
-//         return 1;
-//     }
-//
-//     memcpy(serBuf, sktBuf, sktBytesRead);
-//     printf("%zu<", sktBytesRead);
-//     fflush(stdout);
-//
-//     const ssize_t serialBytesWritten = write(serialFd, serBuf, sktBytesRead);
-//     if (serialBytesWritten < 0) {
-//         // TODO: ignore some errno
-//         perror("write tun_fd error");
-//         printf("%i %zi\n", serialFd, sktBytesRead);
-//         return false;
-//     }
-//
-//     return true;
-// }
+static bool sktToSer(int sktFd, cbuf_handle_t ipCBuf)
+{
+    const int sktBytesRead = readSocket(sktFd, ipCBuf);
+    if (sktBytesRead < 0) {
+        printf("Read error: %i\n", sktBytesRead);
+        return false;
+    }
+    else if (sktBytesRead == 0) {
+        return true;  // No data
+    }
+
+    uint8_t serBuf[1024];
+    while (true) {
+        uint8_t ipVersion;
+        uint16_t ipHdrLen;
+        uint16_t ipPktLen;
+        if (!popIpPkt(ipCBuf, serBuf, sizeof serBuf, &ipVersion, &ipHdrLen, &ipPktLen)) {
+            break;
+        }
+        if (ipVersion != 4) {
+            printf("Skipping IPv%u\n", ipVersion);
+            continue;
+        }
+
+        uint32_t dstIp;
+        uint16_t dstPort;
+        if (!parseIpv4Pkt(ipPktLen, serBuf, &dstIp, &dstPort)) {
+            return true;
+        }
+        // TODO: Modify packet?
+
+        const int serBytesSent = writeSerial(hComm, serBuf, ipPktLen);
+        if (serBytesSent != ipPktLen) {
+            printf("Couldn't send all bytes!");
+            return false;
+        }
+    }
+    return true;
+}
 
 int main(int argc, char **argv)
 {
@@ -468,9 +509,16 @@ int main(int argc, char **argv)
     if (s == INVALID_SOCKET) {
         printf("Socket invalid\n");
     }
-    int optval = 1;
-    if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, (char *) &optval, sizeof(optval)) == SOCKET_ERROR) {
+    int optval1 = 1;
+    if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, (char *) &optval1, sizeof(optval1)) == SOCKET_ERROR) {
         printf("setsockopt IP_HDRINCL failed\n");
+        return 1;
+    }
+    // Set nonblocking
+    unsigned long optval2;
+    const int nRet = ioctlsocket(s, FIONBIO, &optval2);
+    if (nRet == SOCKET_ERROR) {
+        printf("ioctlsocket failed\n");
         return 1;
     }
     // bind to the local address
@@ -498,16 +546,17 @@ int main(int argc, char **argv)
     cbuf_handle_t serialCBuf = circular_buf_init(serialBuf, sizeof serialBuf);
     cbuf_handle_t ipCBuf     = circular_buf_init(ipBuf, sizeof ipBuf);
 
+    fflush(stdout);
     while (!done) {
         if (!serToSkt(serialCBuf, s)) {
             printf("serToSkt error\n");
             break;
         }
 
-        //            if (!sktToSer(ip_fd, ipBuf, serialBuf)) {
-        //                printf("sktToSer error\n");
-        //                break;
-        //            }
+        if (!sktToSer(s, ipCBuf)) {
+            printf("sktToSer error\n");
+            break;
+        }
     }
 
     CloseHandle(hComm);

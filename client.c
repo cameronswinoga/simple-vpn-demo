@@ -79,8 +79,7 @@ static void setup_route_table(void)
 {
     printf("Adding routing tables\n");
 
-    run("ip route add 15.8.0.0/24 dev %s proto static", TUN_INTERFACE);
-    run("ip route add 142.65.58.38/32 dev %s proto static", TUN_INTERFACE);
+    run("ip route add 192.168.1.191/32 dev %s proto static", TUN_INTERFACE);
     run("echo 0 > /proc/sys/net/ipv4/conf/%s/rp_filter", TUN_INTERFACE);
     run("echo 1 > /proc/sys/net/ipv4/conf/%s/accept_local", TUN_INTERFACE);
 }
